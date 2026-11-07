@@ -1,0 +1,24 @@
+.tools/
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+artifacts/
+__pycache__/
+
+# Local previews and generated downloads
+/output/
+
+# Personal setup, local notes, and development archives
+/.local/
+
+# Local credentials and Android signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+key.properties

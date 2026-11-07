@@ -1,0 +1,9 @@
+{
+  "selectedConcept": "U2",
+  "background": "#FAF7F0",
+  "frame": "#2453DC",
+  "dot": "#FF704B",
+  "source": "orbit-u2-reference.png",
+  "productionVector": "orbit-icon.svg",
+  "notes": "Vector reconstruction of selected generated concept. ic_pocket remains the stable resource name for the transparent monochrome notification mark."
+}
