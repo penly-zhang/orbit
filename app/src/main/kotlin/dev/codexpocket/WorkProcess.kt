@@ -53,7 +53,9 @@ import dev.codexpocket.core.*
         }
         if (expanded) {
             val groups = remember(entry.items) { workDisplayGroups(entry.items) }
-            groups.take(visibleCount).forEach { group -> key(group.first().id) {
+            // Live output must include the tail even after a turn exceeds the history page size.
+            val visibleGroups = if (turnRunning) groups else groups.take(visibleCount)
+            visibleGroups.forEach { group -> key(group.first().id) {
                 val item = group.first()
                 if (item.kind == "agentMessage") ConversationBody(item.text, item.images, cwd, session, loader)
                 else WorkSummary(item, group.size, group.any { it.status in setOf("failed", "declined") }) {
@@ -62,7 +64,7 @@ import dev.codexpocket.core.*
                     else selectedId = item.id
                 }
             } }
-            if (groups.size > visibleCount) TextButton(onClick = { visibleCount += 30 }) { Text("再显示 30 条工作记录") }
+            if (!turnRunning && groups.size > visibleCount) TextButton(onClick = { visibleCount += 30 }) { Text("再显示 30 条工作记录") }
             TextButton(onClick = { showSteps = true }, contentPadding = PaddingValues(0.dp)) {
                 Text("查看执行步骤", color = Muted, fontSize = 13.sp)
             }

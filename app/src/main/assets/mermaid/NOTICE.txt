@@ -1,0 +1,4 @@
+Mermaid 11.12.2
+MIT License; see LICENSE.
+Source: https://registry.npmjs.org/mermaid/-/mermaid-11.12.2.tgz
+SHA-256 (mermaid.min.js): d0830a6c05546e9edb8fe20a8f545f3e0dc7c4c3134d584bad9c13a99d7a71e0

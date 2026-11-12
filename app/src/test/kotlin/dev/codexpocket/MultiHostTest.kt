@@ -109,6 +109,107 @@ class MultiHostTest {
             finally { withContext(dispatcher) { controller.close() }; job.cancel(); dispatcher.close() }
         } }
     }
+
+    @Test fun `manual disconnect preserves automatic preference and suppresses foreground resume`() = runBlocking {
+        exercise { controller, a, b, vault ->
+            controller.await { it.connections.values.count { c -> c.connected } == 2 }
+            controller.disconnectHost(a.profile)
+            assertTrue(vault.profiles().first { it.id == a.profile.id }.autoConnect)
+            controller.resumeConnections()
+            delay(250)
+            assertFalse(controller.state.value.connections.getValue(a.profile.id).connected)
+            assertTrue(controller.state.value.connections.getValue(a.profile.id).manuallyPaused)
+            assertEquals(1, a.authentications.get())
+            assertTrue(controller.state.value.connections.getValue(b.profile.id).connected)
+            controller.connectNow(a.profile)
+            controller.await { it.connections.getValue(a.profile.id).connected }
+            assertFalse(controller.state.value.connections.getValue(a.profile.id).manuallyPaused)
+        }
+    }
+
+    @Test fun `renaming connected host and changing automatic preference do not reconnect`() = runBlocking {
+        exercise { controller, a, _, vault ->
+            controller.await { it.connections.values.count { c -> c.connected } == 2 }
+            val renamed = a.profile.copy(name = "Work computer")
+            controller.saveAndConnect(renamed, Credentials(password = "fixture-password"), true, false)
+            controller.setAutoConnect(renamed, false)
+            delay(250)
+            assertTrue(controller.state.value.connections.getValue(a.profile.id).connected)
+            assertEquals(1, a.authentications.get())
+            assertEquals("Work computer", vault.profiles().first { it.id == a.profile.id }.name)
+            assertFalse(vault.profiles().first { it.id == a.profile.id }.autoConnect)
+            controller.disconnectHost(renamed)
+            controller.connectNow(renamed)
+            controller.await { it.connections.getValue(a.profile.id).connected }
+            assertFalse(vault.profiles().first { it.id == a.profile.id }.autoConnect, "Connect once must not enable automatic connection")
+        }
+    }
+
+    @Test fun `Orbit project removal survives discovery and readding preserves native identity`() = runBlocking {
+        exercise { controller, _, _, vault ->
+            val ready = controller.await { it.connected && !it.loading && it.projects.isNotEmpty() }
+            val project = ready.projects.first()
+            val host = ready.profile!!.id
+            controller.removeProject(host, project)
+            assertFalse(controller.state.value.projects.any { it.id == project.id })
+            controller.refreshProjects()
+            controller.await { it.loading }
+            controller.await { !it.loading }
+            assertFalse(controller.state.value.projects.any { it.id == project.id })
+            assertFalse(OrbitProjects(vault, host).apply(listOf(project)).any { it.id == project.id })
+            assertEquals(listOf(project), OrbitProjects(vault, "other-host").apply(listOf(project)))
+            controller.addProject(host, project.roots.first())
+            assertTrue(controller.state.value.projects.any { it.id == project.id })
+            controller.refreshProjects()
+            controller.await { it.loading }
+            controller.await { !it.loading }
+            assertEquals(1, controller.state.value.projects.count { it.id == project.id })
+            val root = "/fixture/new project"
+            controller.addProject(host, root)
+            controller.addProject(host, "$root/")
+            controller.refreshProjects()
+            controller.await { it.loading }
+            controller.await { !it.loading }
+            assertEquals(1, controller.state.value.projects.count { it.id == "cwd:$root" })
+            assertTrue(OrbitProjects(vault, host).apply(emptyList()).any { it.roots == listOf(root) })
+            assertFailsWith<Exception> { controller.addProject(host, "/fixture/unreadable") }
+            assertFalse(controller.state.value.projects.any { "/fixture/unreadable" in it.roots })
+        }
+    }
+
+    @Test fun `cached subdirectory project and open session migrate to Git root without changing cwd or draft`() = runBlocking {
+        val root = Files.createTempDirectory("orbit-project-migration").toRealPath().toFile()
+        val init = ProcessBuilder("git", "init", root.path).redirectErrorStream(true).start()
+        init.inputStream.readBytes()
+        assertEquals(0, init.waitFor())
+        try {
+            val cwd = root.resolve("app").apply { mkdirs() }.path
+            val old = ProjectInfo("cwd:$cwd", "app", listOf(cwd))
+            val thread = ThreadInfo("fixture-saved-ok", "Saved session", cwd)
+            exercise(prepare = { vault ->
+                vault.put("projects:a", json.encodeToString(listOf(old)))
+                vault.put("lastProject:a", old.id)
+                vault.put("workspace:v1", json.encodeToString(SavedWorkspace(listOf(SavedHost("a", listOf(
+                    SavedTab(thread, old, 1, draft = "keep draft")
+                ), thread.id)))))
+            }) { controller, _, _, vault ->
+                val migrated = controller.await { it.connected && it.threadReady && it.project?.id == "cwd:${root.path}" }
+                assertEquals(listOf(root.path), migrated.project!!.roots)
+                assertEquals(cwd, migrated.thread!!.cwd)
+                assertEquals(cwd, migrated.root)
+                assertEquals("keep draft", migrated.draft)
+                assertEquals(migrated.project, migrated.sessionTabs.single().project)
+                assertFalse(migrated.projects.any { it.id == old.id })
+                assertEquals(migrated.project.id, vault.get("lastProject:a"))
+                controller.home()
+                controller.openSession(controller.state.value.sessionTabs.single())
+                val reopened = controller.await { it.thread?.id == thread.id && it.threadReady }
+                assertEquals(migrated.project, reopened.project)
+                assertEquals("keep draft", reopened.draft)
+                assertEquals(cwd, reopened.root)
+            }
+        } finally { root.deleteRecursively() }
+    }
     @Test fun `missing rollout restores locally without poisoning other tabs or losing drafts`() = runBlocking {
         val project = ProjectInfo("fixture-project", "Fixture", listOf("/fixture/project"))
         val valid = ThreadInfo("fixture-saved-ok", "Valid", "/fixture/project")
@@ -313,6 +414,117 @@ class MultiHostTest {
             assertEquals(1, controller.state.value.sessionTabs.size)
             assertEquals("", controller.state.value.newConversationDraft)
             assertEquals("1", controller.artifactRepository(controller.state.value.profile!!.id).probe("probe/stats").text("firstMessages"))
+        }
+    }
+    @Test fun `new task attachments persist without a host and survive rejected send`() = runBlocking {
+        val vault = MemoryVault()
+        val job = SupervisorJob()
+        val scope = CoroutineScope(job + Dispatchers.Unconfined)
+        val file = Files.createTempFile("new-task", ".txt").toFile().apply { writeText("fixture attachment") }
+        val input = ContextInput("local", "notes.txt", localPath = file.absolutePath, bytes = file.length().toInt())
+        val first = PocketController(vault, scope, engines)
+        try {
+            assertTrue(first.beginContextImport(NEW_TASK_DRAFT, 0))
+            assertTrue(first.finishContextImport(NEW_TASK_DRAFT, 0, listOf(input)))
+            first.sendNewConversation()
+            assertEquals(listOf(input), first.state.value.newContext)
+            first.close()
+            val restored = PocketController(vault, scope, engines)
+            try {
+                assertEquals(listOf(input), restored.state.value.newContext)
+                restored.removeContext(NEW_TASK_DRAFT, 0, input.id)
+                assertTrue(restored.state.value.newContext.isEmpty())
+            } finally { restored.close() }
+        } finally { first.close(); job.cancel(); file.delete() }
+    }
+    @Test fun `attachment only first send transfers ownership to one conversation`() = runBlocking {
+        exercise { controller, _, _, _ ->
+            controller.await { it.connected && it.projects.isNotEmpty() }
+            controller.selectProject(controller.state.value.projects.first())
+            controller.newConversation()
+            val file = Files.createTempFile("new-task-send", ".txt").toFile().apply { writeText("fixture document") }
+            try {
+                assertTrue(controller.beginContextImport(NEW_TASK_DRAFT, 0))
+                assertTrue(controller.finishContextImport(NEW_TASK_DRAFT, 0, listOf(ContextInput("local", "notes.txt", localPath = file.absolutePath, bytes = file.length().toInt()))))
+                controller.sendNewConversation(); controller.sendNewConversation()
+                controller.await { !it.creatingConversation && it.threadReady && it.thread != null && !it.sending && it.queuedMessages.isEmpty() }
+                assertEquals(1, controller.state.value.sessionTabs.size)
+                assertTrue(controller.state.value.newContext.isEmpty())
+                assertEquals("1", controller.artifactRepository(controller.state.value.profile!!.id).probe("probe/stats").text("firstMessages"))
+            } finally { file.delete() }
+        }
+    }
+    @Test fun `restart and reconnect reconcile a closed tracked task without opening a tab`() = runBlocking {
+        val project = ProjectInfo("fixture-project", "Fixture", listOf("/fixture/project"))
+        val thread = ThreadInfo("fixture-saved-tracked", "Tracked", "/fixture/project")
+        exercise(prepare = { vault ->
+            vault.put("workspace:v1", json.encodeToString(SavedWorkspace(listOf(SavedHost("a", listOf(
+                SavedTab(thread, project, 1, progress = TaskProgress("saved-turn", "running"), tabOpen = false, tracked = true)
+            ))))))
+        }) { controller, a, _, _ ->
+            controller.await { it.taskRecords.any { tab -> tab.taskReady && tab.progress.status == "completed" } }
+            assertTrue(controller.state.value.sessionTabs.isEmpty())
+            assertEquals("result", taskGroup(controller.state.value, controller.state.value.taskRecords.single()))
+            controller.disconnectHost(a.profile)
+            assertEquals("result", taskGroup(controller.state.value, controller.state.value.taskRecords.single()))
+            controller.connectNow(a.profile)
+            controller.await { it.taskRecords.single().taskReady && it.connections["a"]?.connected == true }
+            assertTrue(controller.state.value.sessionTabs.isEmpty())
+            assertEquals("result", taskGroup(controller.state.value, controller.state.value.taskRecords.single()))
+            controller.openSession(controller.state.value.taskRecords.single())
+            controller.await { it.thread?.id == thread.id && it.threadReady }
+        }
+    }
+
+    @Test fun `closed tracked task receives completion survives storage and can reopen`() = runBlocking {
+        exercise { controller, _, _, vault ->
+            controller.await { it.connected && it.projects.isNotEmpty() }
+            controller.selectProject(controller.state.value.projects.first())
+            controller.newConversation(); controller.newConversationDraft("fixture-queue-tracked")
+            controller.sendNewConversation()
+            controller.await { it.thread != null && it.activeTurn != null && !it.sending && !it.creatingConversation }
+            val tab = controller.state.value.sessionTabs.single()
+            assertTrue(tab.tracked)
+            controller.closeConversation(tab.key)
+            assertTrue(controller.state.value.sessionTabs.isEmpty())
+            assertFalse(controller.state.value.taskRecords.single().tabOpen)
+            controller.artifactRepository(tab.profileId).probe("probe/completeTurn", obj("threadId" to tab.thread.id))
+            controller.await { it.taskRecords.single().progress.status == "completed" }
+            assertEquals("result", taskGroup(controller.state.value, controller.state.value.taskRecords.single()))
+            controller.flushRecovery()
+            val saved = json.decodeFromString<SavedWorkspace>(vault.get("workspace:v1")!!).hosts.flatMap { it.tabs }.single()
+            assertFalse(saved.tabOpen); assertTrue(saved.tracked)
+            controller.openSession(controller.state.value.taskRecords.single())
+            controller.await { it.threadReady && it.sessionTabs.size == 1 }
+            assertTrue(controller.state.value.taskRecords.single().progress.seen)
+            controller.draft("fixture-queue-next"); controller.send()
+            controller.await { it.activeTurn != null && !it.sending }
+            assertFalse(controller.state.value.taskRecords.single().progress.seen)
+        }
+    }
+
+    @Test fun `viewing a completed turn is automatic and remains read across refresh and storage`() = runBlocking {
+        exercise { controller, _, _, vault ->
+            controller.await { it.connected && it.projects.isNotEmpty() }
+            controller.selectProject(controller.state.value.projects.first())
+            controller.newConversation(); controller.newConversationDraft("fixture-queue-acceptance")
+            controller.sendNewConversation()
+            controller.await { it.thread != null && it.activeTurn != null && !it.sending && !it.creatingConversation }
+            controller.setAppVisible(false)
+            controller.artifactRepository(controller.state.value.profile!!.id).probe("probe/completeTurn", obj("threadId" to controller.state.value.thread!!.id))
+            controller.await { it.sessionTabs.any { tab -> tab.taskReady && tab.progress.status == "completed" } && !it.sending }
+            val tab = controller.state.value.sessionTabs.single()
+            assertEquals("本轮已结束", taskPresentation(controller.state.value, tab).label)
+            assertTrue(attentionTasks(controller.state.value).isEmpty())
+            assertFalse(tab.progress.seen)
+            controller.setAppVisible(true)
+            assertTrue(controller.state.value.sessionTabs.single().progress.seen)
+            controller.flushRecovery()
+            val saved = json.decodeFromString<SavedWorkspace>(vault.get("workspace:v1")!!)
+            assertTrue(saved.hosts.flatMap { it.tabs }.single().progress.seen)
+            controller.refreshThread()
+            controller.await { it.threadReady && !it.attaching }
+            assertTrue(controller.state.value.sessionTabs.single().progress.seen)
         }
     }
     @Test fun `first home send stays on its originating host while browsing elsewhere`() = runBlocking {
@@ -661,6 +873,11 @@ class MultiHostTest {
                 controller.newThread(); controller.await { it.threadReady && it.thread != null }
                 val thread = controller.state.value.thread!!.id
                 controller.draft("fixture-queue-start"); controller.send(); controller.await { it.activeTurn != null && !it.sending }
+                delay(8500)
+                assertNull(controller.state.value.taskReview, "Running turns must not poll code changes, even in the foreground")
+                controller.chooseReviewRange("task")
+                controller.await { it.taskReview != null && !it.taskReviewLoading }
+                controller.chooseReviewRange("workspace")
                 controller.tab(2); controller.await { !it.changesLoading && it.changesRoot == root.path }
                 val change = controller.state.value.changes.single()
                 controller.toggleReviewViewed(change.path, "working")

@@ -29,10 +29,10 @@ import kotlinx.coroutines.flow.Flow
 
 /** Same composer for real conversations and device UI checks; callbacks never change settings optimistically. */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
-@Composable internal fun MessageComposer(s: PocketState, actions: ComposerActions, completions: Flow<SendCompletion>, contextActions: ContextActions? = null) {
+@Composable internal fun MessageComposer(s: PocketState, actions: ComposerActions, completions: Flow<SendCompletion>, contextActions: ContextActions? = null, newConversation: Boolean = false) {
     var contextPicker by remember(s.profile?.id, s.thread?.id) { mutableStateOf(false) }
     var toolPicker by remember(s.profile?.id, s.thread?.id) { mutableStateOf(false) }
-    LaunchedEffect(s.draft) { if (contextActions != null && Regex("(^|\\s)@$" ).containsMatchIn(s.draft)) contextPicker = true }
+    LaunchedEffect(s.draft) { if (contextActions != null && s.connected && s.project != null && Regex("(^|\\s)@$" ).containsMatchIn(s.draft)) contextPicker = true }
     var showUsage by rememberSaveable(s.profile?.id, s.thread?.id) { mutableStateOf(false) }
     var inputFocused by remember(s.profile?.id, s.thread?.id) { mutableStateOf(false) }
     var permissionOpen by remember(s.profile?.id, s.thread?.id) { mutableStateOf(false) }
@@ -42,7 +42,7 @@ import kotlinx.coroutines.flow.Flow
     val contextPercent = s.usage[s.thread?.id]?.contextPercent
     val destination = listOfNotNull(s.project?.name?.takeIf { it.isNotBlank() }, s.profile?.name?.takeIf { it.isNotBlank() }).joinToString(" · ").ifBlank { "选择项目和电脑" }
     val connectionHint = when { s.reconnecting -> "正在重连…"; s.connecting -> "正在连接…"; !s.connected -> "已断开"; else -> null }
-    val locationLabel = listOfNotNull("在 $destination 上工作", connectionHint).joinToString(" · ")
+    val locationLabel = if (s.project == null) "输入消息，开始新任务…" else listOfNotNull("在 $destination 上工作", connectionHint).joinToString(" · ")
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     LaunchedEffect(imeVisible) {
@@ -69,9 +69,10 @@ import kotlinx.coroutines.flow.Flow
             if (s.draftImages.isNotEmpty() || s.imagesLoading || s.imageError != null) DraftImageTray(s, actions.removeImage)
             if (!supportsImages && s.draftImages.isNotEmpty()) Text("当前模型不支持图片，请先切换模型", color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 18.dp, vertical = 5.dp))
             Row(Modifier.fillMaxWidth().heightIn(min = if (expanded) 0.dp else 56.dp).padding(horizontal = if (expanded) 0.dp else 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (!expanded) ComposerAddButton(s, actions, supportsImages, contextActions, { contextPicker = true }, { toolPicker = true })
+            if (!expanded) ComposerAddButton(s, actions, supportsImages, contextActions, { contextPicker = true }, { toolPicker = true }, newConversation)
             // Keep one editor in the same composition position during the height transition.
             key("message-editor") { BasicTextField(s.draft, actions.draft,
+                enabled = !newConversation || !s.creatingConversation,
                 modifier = Modifier.weight(1f).onFocusChanged { inputFocused = it.isFocused }
                     .padding(start = if (expanded) 16.dp else 10.dp, end = if (expanded) 16.dp else 8.dp,
                         top = if (expanded) 14.dp else 10.dp, bottom = if (expanded) 4.dp else 10.dp),
@@ -82,13 +83,13 @@ import kotlinx.coroutines.flow.Flow
                     if (s.draft.isEmpty()) Text(locationLabel, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp, lineHeight = 22.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     editor()
                 } }) }
-            if (!expanded) ComposerSendButton(s, actions, showStop, supportsImages)
+            if (!expanded) ComposerSendButton(s, actions, showStop, supportsImages, newConversation)
             }
             if (expanded) {
             Row(Modifier.fillMaxWidth().padding(start = 6.dp, end = 8.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                ComposerAddButton(s, actions, supportsImages, contextActions, { contextPicker = true }, { toolPicker = true })
+                ComposerAddButton(s, actions, supportsImages, contextActions, { contextPicker = true }, { toolPicker = true }, newConversation)
                 ComposerPermission(s, actions) { permissionOpen = it }
-                TextButton(onClick = { showUsage = true; actions.refreshUsage() },
+                TextButton(onClick = { showUsage = true; actions.refreshUsage() }, enabled = !newConversation,
                     modifier = Modifier.defaultMinSize(minWidth = if (LocalDensity.current.fontScale >= 1.5f) 76.dp else 48.dp).height(48.dp).semantics { contentDescription = contextPercent?.let { "上下文已使用 $it%，查看详细用量" } ?: "上下文用量，查看详细信息" },
                     contentPadding = PaddingValues(horizontal = 5.dp),
                     colors = ButtonDefaults.textButtonColors(contentColor = if (contextPercent != null && contextPercent >= 85) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)) {
@@ -96,7 +97,7 @@ import kotlinx.coroutines.flow.Flow
                 }
                 ComposerModel(s, actions, Modifier.weight(1f)) { modelOpen = it }
                 Spacer(Modifier.width(6.dp))
-                ComposerSendButton(s, actions, showStop, supportsImages)
+                ComposerSendButton(s, actions, showStop, supportsImages, newConversation)
             }
             }
         }
@@ -115,27 +116,35 @@ import kotlinx.coroutines.flow.Flow
 
 }
 
-@Composable private fun ComposerAddButton(s: PocketState, actions: ComposerActions, supportsImages: Boolean, context: ContextActions?, references: () -> Unit, tools: () -> Unit) {
+@Composable private fun ComposerAddButton(s: PocketState, actions: ComposerActions, supportsImages: Boolean, context: ContextActions?, references: () -> Unit, tools: () -> Unit, newConversation: Boolean) {
     var menu by remember { mutableStateOf(false) }
     Box {
-        IconButton(onClick = { if (context == null) actions.addImage() else menu = true }, enabled = s.thread != null && !s.sending && !s.imagesLoading && !s.contextLoading, modifier = Modifier.size(48.dp)) {
+        IconButton(onClick = { if (context == null) actions.addImage() else menu = true }, enabled = (s.thread != null || newConversation) && !s.sending && !s.imagesLoading && !s.contextLoading, modifier = Modifier.size(48.dp)) {
             Icon(Icons.Outlined.Add, if (context == null) "添加图片" else "添加附件、上下文或工具", Modifier.size(27.dp))
         }
         DropdownMenu(menu, { menu = false }) {
             DropdownMenuItem(text = { Text("照片") }, leadingIcon = { Icon(Icons.Outlined.Image, null) }, enabled = supportsImages && s.draftImages.size < MAX_OUTGOING_IMAGES, onClick = { menu = false; actions.addImage() })
             DropdownMenuItem(text = { Text("上传文件") }, leadingIcon = { Icon(Icons.Outlined.AttachFile, null) }, enabled = s.draftContext.size < MAX_CONTEXT_ITEMS, onClick = { menu = false; context?.addDocument?.invoke() })
-            DropdownMenuItem(text = { Text("引用文件或代码 @") }, leadingIcon = { Icon(Icons.Outlined.AlternateEmail, null) }, enabled = s.connected && s.draftContext.size < MAX_CONTEXT_ITEMS, onClick = { menu = false; references() })
+            DropdownMenuItem(text = { Text("引用文件或代码 @") }, leadingIcon = { Icon(Icons.Outlined.AlternateEmail, null) }, enabled = s.connected && s.project != null && (!newConversation || s.newConversationEngine in s.availableEngines) && s.draftContext.size < MAX_CONTEXT_ITEMS, onClick = { menu = false; references() })
             HorizontalDivider()
-            DropdownMenuItem(text = { Text("工具与能力") }, leadingIcon = { Icon(Icons.Outlined.Build, null) }, enabled = s.connected, onClick = { menu = false; tools() })
+            DropdownMenuItem(text = { Text("工具与能力") }, leadingIcon = { Icon(Icons.Outlined.Build, null) }, enabled = s.connected && !newConversation, onClick = { menu = false; tools() })
         }
     }
 }
 
-@Composable private fun ComposerSendButton(s: PocketState, actions: ComposerActions, showStop: Boolean, supportsImages: Boolean) {
+@Composable private fun ComposerSendButton(s: PocketState, actions: ComposerActions, showStop: Boolean, supportsImages: Boolean, newConversation: Boolean) {
     FilledIconButton(onClick = { if (showStop) actions.stop() else actions.send() },
-        enabled = s.connected && s.threadReady && !s.sending && !s.settingsApplying && !s.sendingComments && !s.imagesLoading && !s.contextLoading && (showStop || s.draft.isNotBlank() || s.draftImages.isNotEmpty() || s.draftContext.isNotEmpty()) && (s.draftImages.isEmpty() || supportsImages),
+        enabled = composerSendEnabled(s, newConversation, showStop, supportsImages),
         colors = IconButtonDefaults.filledIconButtonColors(containerColor = Ink, contentColor = Paper), modifier = Modifier.size(48.dp)) {
         if (s.sending) CircularProgressIndicator(Modifier.size(19.dp), color = Paper, strokeWidth = 2.dp)
         else Icon(if (showStop) Icons.Outlined.Stop else Icons.Outlined.ArrowUpward, if (showStop) "停止任务" else if (s.activeTurn != null || s.queuedMessages.isNotEmpty()) "加入待发队列" else "发送", Modifier.size(24.dp))
     }
+}
+
+internal fun composerSendEnabled(s: PocketState, newConversation: Boolean, showStop: Boolean, supportsImages: Boolean): Boolean {
+    val ready = if (newConversation) s.project == null || (s.connected && s.newConversationEngine in s.availableEngines)
+        else s.connected && s.threadReady
+    return ready && !s.sending && !s.settingsApplying && !s.sendingComments && !s.imagesLoading && !s.contextLoading &&
+        (showStop || s.draft.isNotBlank() || s.draftImages.isNotEmpty() || s.draftContext.isNotEmpty()) &&
+        (s.draftImages.isEmpty() || supportsImages)
 }

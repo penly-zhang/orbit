@@ -28,16 +28,23 @@ internal fun shareText(context: Context, title: String, text: String) {
     var menu by remember { mutableStateOf(false) }
     var prompts by rememberSaveable { mutableStateOf(false) }
     var history by rememberSaveable { mutableStateOf(false) }
+    var resultOpen by rememberSaveable { mutableStateOf(false) }
+    val selectedTab = s.sessionTabs.find { it.profileId == s.profile?.id && it.thread.id == s.thread?.id }
     var editing by remember { mutableStateOf<QuickPrompt?>(null) }
     var title by remember { mutableStateOf("") }
     var text by remember { mutableStateOf("") }
     val prefs by vm.preferences.collectAsStateWithLifecycle()
+    if (resultOpen && selectedTab != null) TaskResultSheet(s, vm, selectedTab) { resultOpen = false }
     IconButton(onClick = { menu = true }, modifier = Modifier.size(40.dp)) { Icon(Icons.Outlined.MoreHoriz, "聊天工具") }
     if (menu) ModalBottomSheet(onDismissRequest = { menu = false }) {
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 28.dp)) {
             item { Text("聊天工具", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 18.dp)) }
             item { ActionRow(if (searching) "关闭消息搜索" else "搜索会话消息", Icons.Outlined.Search) { menu = false; toggleSearch() } }
             item { ActionRow("刷新消息", Icons.Outlined.Refresh, s.connected && !s.loading) { menu = false; vm.refreshThread() } }
+            if (selectedTab != null) {
+                item { ActionRow("查看本轮结果", Icons.Outlined.Assignment, s.activeTurn == null && (taskResult(s, selectedTab) != null || selectedTab.progress.status in setOf("completed", "failed", "interrupted"))) { menu = false; resultOpen = true } }
+                item { ActionRow(if (selectedTab.tracked) "取消关注任务" else "关注任务", Icons.Outlined.BookmarkBorder) { menu = false; vm.trackTask(selectedTab, !selectedTab.tracked) } }
+            }
             item { ActionRow("文件", Icons.Outlined.FolderOpen, s.connected) { menu = false; vm.tab(1) } }
             item { ActionRow("变更", Icons.Outlined.Difference, s.connected) { menu = false; vm.tab(2) } }
             item { HorizontalDivider(Modifier.padding(horizontal = 18.dp)) }

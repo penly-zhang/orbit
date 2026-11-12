@@ -32,20 +32,20 @@ fun shellQuote(value: String): String {
 class SshConnection private constructor(private val sessions: List<Session>, private val channel: ChannelExec, val wire: WebSocketWire, private val profile: HostProfile) : Closeable {
     private val session get() = sessions.last()
     companion object {
-        suspend fun connect(profile: HostProfile, credentials: Credentials, command: String): SshConnection {
+        suspend fun connect(profile: HostProfile, credentials: Credentials, command: String, handshake: Boolean = true): SshConnection {
             val resources = java.util.concurrent.CopyOnWriteArrayList<Session>()
             fun closeResources() { resources.asReversed().forEach { it.disconnect() } }
             return try {
                 coroutineScope {
                     val attempt = async(Dispatchers.IO) {
-                        try { connectProfile(profile, credentials, resources, command) }
+                        try { connectProfile(profile, credentials, resources, command, handshake) }
                         catch (error: Exception) { currentCoroutineContext().ensureActive(); throw error }
                     }
                     try { attempt.await() } catch (error: Exception) { closeResources(); throw error }
                 }
             } catch (error: Exception) { closeResources(); throw error }
         }
-        private suspend fun connectProfile(profile: HostProfile, credentials: Credentials, resources: MutableList<Session>, command: String): SshConnection = withContext(Dispatchers.IO) {
+        private suspend fun connectProfile(profile: HostProfile, credentials: Credentials, resources: MutableList<Session>, command: String, handshake: Boolean): SshConnection = withContext(Dispatchers.IO) {
             require(profile.host.isNotBlank() && profile.username.isNotBlank() && profile.port in 1..65535) { "请填写正确的 SSH 地址、端口和用户名" }
             require(profile.jumpHosts.size <= 8) { "最多支持 8 个 SSH 跳板" }
             require(!profile.proxyEnabled || (profile.proxyHost.isNotBlank() && profile.proxyPort in 1..65535)) { "请填写正确的 SOCKS5 代理地址和端口" }
@@ -73,7 +73,7 @@ class SshConnection private constructor(private val sessions: List<Session>, pri
                 exec = stream.channel
                 val wire = WebSocketWire(stream.input, stream.output)
                 val watchdog = launch(Dispatchers.IO) { delay(15000); stream.channel.disconnect() }
-                try { wire.handshake() } catch (error: Exception) { throw IOException("${error.message}\n${stream.errors.toString("UTF-8")}".trim()) }
+                try { if (handshake) wire.handshake() } catch (error: Exception) { throw IOException("${error.message}\n${stream.errors.toString("UTF-8")}".trim()) }
                 finally { watchdog.cancel() }
                 SshConnection(sessions.toList(), stream.channel, wire, profile)
             } catch (error: Exception) {

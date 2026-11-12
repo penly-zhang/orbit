@@ -6,8 +6,7 @@ import kotlinx.serialization.json.JsonObject
 /** Forks can reuse this adapter only when they preserve the app-server proxy protocol. */
 class CodexEngine(override val descriptor: EngineDescriptor = EngineDescriptor("codex", "Codex")) : AgentEngine {
     fun command(profile: HostProfile): String {
-        require(!descriptor.requiresExecutable || profile.codexPath.isNotBlank()) { "请填写兼容 Agent 的可执行文件路径" }
-        return proxyCommand(profile.codexPath)
+        return discoveredProxyCommand(descriptor.id)
     }
     override suspend fun open(profile: HostProfile, credentials: Credentials, scope: CoroutineScope): AgentRepository {
         val ssh = SshConnection.connect(profile, credentials, command(profile))

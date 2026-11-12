@@ -31,7 +31,7 @@ private suspend fun readSshText(context: Context, uri: Uri, max: Int): String = 
     }
 }
 
-@Composable internal fun SshRouteEditor(profile: HostProfile, secrets: Map<String, JumpCredentials>, change: (HostProfile) -> Unit, changeSecrets: (Map<String, JumpCredentials>) -> Unit) {
+@Composable internal fun SshConfigImporter(profile: HostProfile, change: (HostProfile) -> Unit, changeSecrets: (Map<String, JumpCredentials>) -> Unit) {
     val context = LocalContext.current; val scope = rememberCoroutineScope()
     var error by remember { mutableStateOf<String?>(null) }
     var config by remember { mutableStateOf<SshConfigImport?>(null) }
@@ -41,31 +41,8 @@ private suspend fun readSshText(context: Context, uri: Uri, max: Int): String = 
             if (parsed.aliases.isEmpty()) error = "配置中没有可选择的 Host 别名" else { config = parsed; configName = ""; error = null }
         }.onFailure { error = it.message }
     } }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("SSH 连接路径", style = MaterialTheme.typography.titleSmall)
-        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("direct" to "直接 / ProxyJump", "loginShell" to "登录自动跳转", "remoteSsh" to "A 上的 SSH 别名").forEach { (mode, label) ->
-                FilterChip(profile.routeMode == mode, { change(profile.copy(routeMode = mode)) }, label = { Text(label, fontSize = 12.sp) })
-            }
-        }
-        when (profile.routeMode) {
-            "loginShell" -> Text("登录 A 并启动交互式登录环境，沿用 A→B 的免密自动跳转。Agent、文件和 Git 命令均在最终目标运行。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            "remoteSsh" -> {
-                OutlinedTextField(profile.remoteTarget, { change(profile.copy(remoteTarget = it.trim())) }, label = { Text("A 上可免密 SSH 的别名或 user@B") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Text("沿用 A 上的 ~/.ssh/config（含 ProxyJump）和密钥。B 的主机指纹需已由 A 信任。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        OutlinedButton(onClick = { import.launch(arrayOf("*/*")) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Outlined.FileOpen, null, Modifier.size(17.dp)); Spacer(Modifier.width(6.dp)); Text("导入 SSH config 别名与 ProxyJump", fontSize = 12.sp) }
-        if (profile.jumpHosts.isNotEmpty()) Text("按顺序连接跳板 → 目标。上方地址填写最终目标；SOCKS5 只用于第一个入口。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        profile.jumpHosts.forEachIndexed { index, hop -> key(hop.id) {
-            JumpEditor(hop, secrets[hop.id] ?: JumpCredentials(), index + 1,
-                { updated -> change(profile.copy(jumpHosts = profile.jumpHosts.map { if (it.id == hop.id) updated else it })) },
-                { secret -> changeSecrets(secrets + (hop.id to secret)) },
-                { change(profile.copy(jumpHosts = profile.jumpHosts.filterNot { it.id == hop.id })); changeSecrets(secrets - hop.id) })
-        } }
-        if (profile.jumpHosts.size < 8) TextButton(onClick = { change(profile.copy(jumpHosts = profile.jumpHosts + JumpHost(UUID.randomUUID().toString(), "", username = profile.username))) }) { Icon(Icons.Outlined.Add, null, Modifier.size(16.dp)); Text("添加 SSH 跳板", fontSize = 12.sp) }
-        if (error != null) Text(error!!, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-    }
+        OutlinedButton(onClick = { import.launch(arrayOf("*/*")) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Outlined.FileOpen, null, Modifier.size(17.dp)); Spacer(Modifier.width(6.dp)); Text("导入 SSH 配置", fontSize = 12.sp) }
+    if (error != null) Text(error!!, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
     config?.let { parsed -> AlertDialog(onDismissRequest = { config = null }, title = { Text("选择 SSH Host 别名") }, text = {
         Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("导入 HostName、User、Port 和 ProxyJump。密钥请在手机上另行选择。", fontSize = 12.sp)
@@ -77,6 +54,33 @@ private suspend fun readSshText(context: Context, uri: Uri, max: Int): String = 
             changeSecrets(emptyMap()); config = null; error = if (route.keyFile != null || route.jumps.any { it.authType == "key" }) "配置已导入；请分别选择目标与跳板使用的私钥文件。" else null
         }.onFailure { error = it.message; config = null }
     }) { Text("导入") } }, dismissButton = { TextButton(onClick = { config = null }) { Text("取消") } }) }
+}
+
+@Composable internal fun SshRouteEditor(profile: HostProfile, secrets: Map<String, JumpCredentials>, change: (HostProfile) -> Unit, changeSecrets: (Map<String, JumpCredentials>) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("连接方式", style = MaterialTheme.typography.titleSmall)
+        listOf("direct" to "直接连接或通过跳板", "remoteSsh" to "通过入口电脑上的 SSH 别名", "loginShell" to "登录后自动跳转").forEach { (mode, label) ->
+            Row(Modifier.fillMaxWidth().clickable { change(profile.copy(routeMode = mode)) }, verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(profile.routeMode == mode, { change(profile.copy(routeMode = mode)) }); Text(label, fontSize = 14.sp)
+            }
+        }
+        when (profile.routeMode) {
+            "loginShell" -> Text("上方填写入口电脑的地址和登录信息。登录后沿用电脑已配置的自动跳转，在最终工作电脑上运行任务。", fontSize = 12.sp, color = Muted)
+            "remoteSsh" -> {
+                OutlinedTextField(profile.remoteTarget, { change(profile.copy(remoteTarget = it.trim())) }, label = { Text("工作电脑的 SSH 别名或 user@host") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("上方填写入口电脑。入口电脑需已能免密 SSH 到工作电脑，并信任其指纹。", fontSize = 12.sp, color = Muted)
+            }
+            else -> Text("上方填写目标电脑。需要跳板时，按经过的顺序添加；代理只用于第一个入口。", fontSize = 12.sp, color = Muted)
+        }
+        Text(if (profile.routeMode == "direct") "手机 → ${if (profile.jumpHosts.isEmpty()) "" else "跳板 → "}目标电脑" else "手机 → ${if (profile.jumpHosts.isEmpty()) "" else "跳板 → "}入口电脑 → 工作电脑", fontSize = 13.sp, color = Muted)
+        profile.jumpHosts.forEachIndexed { index, hop -> key(hop.id) {
+            JumpEditor(hop, secrets[hop.id] ?: JumpCredentials(), index + 1,
+                { updated -> change(profile.copy(jumpHosts = profile.jumpHosts.map { if (it.id == hop.id) updated else it })) },
+                { secret -> changeSecrets(secrets + (hop.id to secret)) },
+                { change(profile.copy(jumpHosts = profile.jumpHosts.filterNot { it.id == hop.id })); changeSecrets(secrets - hop.id) })
+        } }
+        if (profile.jumpHosts.size < 8) TextButton(onClick = { change(profile.copy(jumpHosts = profile.jumpHosts + JumpHost(UUID.randomUUID().toString(), "", username = profile.username))) }) { Icon(Icons.Outlined.Add, null, Modifier.size(16.dp)); Text("添加跳板", fontSize = 12.sp) }
+    }
 }
 
 @Composable private fun JumpEditor(hop: JumpHost, secret: JumpCredentials, number: Int, change: (JumpHost) -> Unit, changeSecret: (JumpCredentials) -> Unit, remove: () -> Unit) {

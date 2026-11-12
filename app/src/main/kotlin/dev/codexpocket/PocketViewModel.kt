@@ -3,13 +3,16 @@ package dev.codexpocket
 import android.app.Application
 import android.net.Uri
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.filterNotNull
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.codexpocket.core.*
 import kotlinx.serialization.json.*
 
-data class HostConnectionStatus(val connected: Boolean = false, val connecting: Boolean = false, val reconnecting: Boolean = false, val attempt: Int = 0, val needsCredentials: Boolean = false, val needsTrust: Boolean = false, val error: String? = null) {
-    val label: String get() = when { needsTrust -> "待确认指纹"; needsCredentials -> "需填写登录信息"; reconnecting -> "正在重新连接…"; connecting -> "正在建立连接…"; connected -> "已连接"; error != null -> "连接失败"; else -> "已断开" }
+data class HostConnectionStatus(val connected: Boolean = false, val connecting: Boolean = false, val reconnecting: Boolean = false, val attempt: Int = 0, val needsCredentials: Boolean = false, val needsTrust: Boolean = false, val error: String? = null, val availableEngines: List<String> = emptyList(), val engineIssues: Map<String, String> = emptyMap(), val manuallyPaused: Boolean = false, val connectionError: String? = error) {
+    val label: String get() = when { manuallyPaused -> "已断开"; needsTrust -> "待确认指纹"; needsCredentials -> "需填写登录信息"; reconnecting -> "正在重新连接…"; connecting -> "正在建立连接…"; connected -> "已连接"; connectionError != null -> "连接失败"; else -> "已断开" }
 }
 data class HostProject(val profileId: String, val profileName: String, val project: ProjectInfo) { val key: String get() = "$profileId:${project.id}" }
 internal fun HostProfile.connectionLabel(profiles: List<HostProfile>): String = if (profiles.count { it.name == name } > 1) "$name · $host" else name
@@ -19,11 +22,15 @@ data class SendCompletion(val profileId: String, val threadId: String, val clear
 data class PendingRequest(val id: JsonElement, val kind: RequestKind, val params: JsonObject, val profileId: String = "")
 @kotlinx.serialization.Serializable data class DraftImage(val id: String, val path: String, val name: String, val bytes: Int)
 internal data class ImageImportBudget(val count: Int, val bytes: Int)
-data class SessionTab(val thread: ThreadInfo, val project: ProjectInfo, val number: Int, val name: String = "", val running: Boolean = false, val unread: Boolean = false, val profileId: String = "", val profileName: String = "", val hasDraft: Boolean = false, val displayNumber: Int = number) {
+data class SessionTab(val thread: ThreadInfo, val project: ProjectInfo, val number: Int, val name: String = "", val running: Boolean = false, val unread: Boolean = false, val profileId: String = "", val profileName: String = "", val hasDraft: Boolean = false, val displayNumber: Int = number, val progress: TaskProgress = TaskProgress(), val taskReady: Boolean = false, val taskSending: Boolean = false, val taskIssue: String? = null, val tabOpen: Boolean = true, val tracked: Boolean = false) {
     val key: String get() = "$profileId:${thread.id}"
     val label: String get() = name.ifBlank { displayNumber.toString() }
 }
 data class PocketState(
+    val engineIssues: Map<String, String> = emptyMap(),
+    val availableEngines: List<String> = emptyList(), val newConversationEngine: String = "codex",
+    val newImages: List<DraftImage> = emptyList(), val newContext: List<ContextInput> = emptyList(),
+    val newImagesLoading: Boolean = false, val newContextLoading: Boolean = false, val newAttachmentError: String? = null,
     val browsingProjects: Boolean = false, val newConversationDraft: String = "", val creatingConversation: Boolean = false,
     val profiles: List<HostProfile> = emptyList(), val profile: HostProfile? = null, val connecting: Boolean = false, val connected: Boolean = false,
     val reconnecting: Boolean = false, val reconnectAttempt: Int = 0,
@@ -37,6 +44,7 @@ data class PocketState(
     val tab: Int = 0, val threads: List<ThreadInfo> = emptyList(), val threadCursor: String? = null,
     val threadsLoading: Boolean = false, val threadsCached: Boolean = false, val threadsError: String? = null,
     val sessionTabs: List<SessionTab> = emptyList(),
+    val taskRecords: List<SessionTab> = emptyList(),
     val navigationThreads: Map<String, List<ThreadInfo>> = emptyMap(),
     val pinnedThreads: Map<String, List<String>> = emptyMap(),
     val archiveUndo: ArchiveUndo? = null,
@@ -66,7 +74,18 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     val preferences = runtime.preferences
     fun updatePreferences(change: (AppPreferences) -> AppPreferences) = runtime.update(change)
     fun appVisible(value: Boolean) = runtime.foreground(value)
-    fun openSessionKey(key: String) { state.value.sessionTabs.find { it.key == key }?.let(controller::openSession) }
+    private var notificationNavigation: Job? = null
+    fun openSessionKey(key: String) {
+        if (key.isBlank()) return
+        notificationNavigation?.cancel()
+        notificationNavigation = viewModelScope.launch {
+            // A notification can launch a new process before the saved workspace has loaded.
+            val tab = withTimeoutOrNull(30_000) {
+                state.map { allTaskSessions(it).find { tab -> tab.key == key } }.filterNotNull().first()
+            }
+            tab?.let(controller::openSession)
+        }
+    }
     val state get() = controller.state
     val sendCompleted get() = controller.sendCompleted
     internal fun imageLoaderFor(id: String) = controller.imageLoaderFor(id)
@@ -136,6 +155,10 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     fun newConversationDraft(text: String) = controller.newConversationDraft(text)
     fun sendNewConversation() = controller.sendNewConversation()
     fun home() { controller.home() }
+    suspend fun addProject(host: String, path: String) = controller.addProject(host, path)
+    suspend fun projectDirectories(host: String, path: String) = controller.artifactRepository(host).files(path).filter { it.directory }
+    fun removeProject(host: String, project: ProjectInfo) = controller.removeProject(host, project)
+    fun moveProject(host: String, projectId: String, offset: Int) = controller.moveProject(host, projectId, offset)
     fun refreshProjects() { controller.refreshProjects() }
     fun selectProject(project: ProjectInfo) { controller.selectProject(project) }
     fun changeRoot(root: String) { controller.changeRoot(root) }
@@ -149,8 +172,10 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     fun closeThread() { controller.closeThread() }
     fun refreshThread() { controller.refreshThread() }
     fun refreshUsage() { controller.refreshUsage() }
+    fun loadAllHistory() = controller.loadAllHistory()
     fun moreHistory() { controller.moreHistory() }
     fun newThread() { controller.newThread() }
+    fun chooseNewConversationEngine(id: String) { controller.chooseNewConversationEngine(id) }
     fun draft(text: String) { controller.draft(text) }
     fun refreshChoices() { controller.refreshChoices() }
     fun pinThread(projectId: String, threadId: String, pinned: Boolean) { controller.pinThread(projectId, threadId, pinned) }
@@ -239,7 +264,10 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     fun selectHost(id: String) { controller.selectHost(id) }
     fun selectHostProject(project: HostProject) { controller.selectHostProject(project) }
     fun openSession(tab: SessionTab) { controller.openSession(tab) }
-    fun saveAndConnect(profile: HostProfile, credentials: Credentials, remember: Boolean) { controller.saveAndConnect(profile, credentials, remember) }
+    fun saveAndConnect(profile: HostProfile, credentials: Credentials, remember: Boolean, connectNow: Boolean = profile.autoConnect) { controller.saveAndConnect(profile, credentials, remember, connectNow) }
+    fun connectNow(profile: HostProfile) = controller.connectNow(profile)
+    fun disconnectHost(profile: HostProfile) = controller.disconnectHost(profile)
+    fun setAutoConnect(profile: HostProfile, enabled: Boolean) = controller.setAutoConnect(profile, enabled)
     fun moveProfile(id: String, direction: Int) { controller.moveProfile(id, direction) }
     fun deleteProfile(profile: HostProfile) { controller.deleteProfile(profile) }
     fun disconnect() { controller.disconnect() }
@@ -251,7 +279,10 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     fun decide(request: PendingRequest, accept: Boolean) { controller.decide(request, accept) }
     fun answerMcp(request: PendingRequest, action: String, content: JsonObject?) = controller.answerMcp(request, action, content)
     fun answerQuestions(request: PendingRequest, answers: Map<String, String>) { controller.answerQuestions(request, answers) }
+    fun trackTask(tab: SessionTab, tracked: Boolean) = controller.trackTask(tab, tracked)
+    fun dismissTaskReminder(tab: SessionTab) = controller.dismissTaskReminder(tab)
     fun clearError() { controller.clearError() }
+    fun credentialsForEditing(id: String) = controller.credentialsForEditing(id)
     fun storedCredentials(id: String) = controller.storedCredentials(id)
     fun reconnect(profile: HostProfile) = controller.reconnect(profile)
     fun setConnectionEnabled(profile: HostProfile, enabled: Boolean) = controller.setConnectionEnabled(profile, enabled)

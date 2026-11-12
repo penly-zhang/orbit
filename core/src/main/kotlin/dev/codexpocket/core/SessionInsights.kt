@@ -27,10 +27,10 @@ fun connectionAdvice(message: String): ConnectionAdvice {
     val text = message.lowercase()
     return when {
         "auth fail" in text || "authentication" in text || "permission denied" in text -> ConnectionAdvice("SSH 登录未通过", "在设置中核对用户名、密码或私钥，以及跳板的登录信息。")
-        "not found" in text && ("codex" in text || "127" in text) -> ConnectionAdvice("电脑未找到 Agent", "填写所选 Agent 可执行文件的完整路径，并确认服务已启动。")
+        "not found" in text && ("codex" in text || "127" in text) -> ConnectionAdvice("电脑未找到 Agent", "确认电脑已安装并登录 Codex 或 traex，再重新连接检测 Agent。")
         "refused" in text -> ConnectionAdvice("电脑拒绝连接", "确认电脑已开启 SSH、端口正确且电脑没有休眠。")
         "resolve" in text || "unknownhost" in text -> ConnectionAdvice("无法解析电脑地址", "核对地址，并确认 VPN、DNS 或代理可用。")
-        "timeout" in text || "timed out" in text || "network" in text || "socket" in text -> ConnectionAdvice("网络连接中断", "检查手机网络、VPN、代理和电脑是否在线；连接开关开启时会自动重试。")
-        else -> ConnectionAdvice("连接暂不可用", "确认电脑在线、SSH 可访问，且所选 Agent 已启动；可在设置中编辑连接后重试。")
+        "timeout" in text || "timed out" in text || "network" in text || "socket" in text -> ConnectionAdvice("网络连接中断", "检查手机网络、VPN、代理和电脑是否在线；启用自动连接时会自动重试。")
+        else -> ConnectionAdvice("连接暂不可用", "确认电脑在线、SSH 可访问，且 Agent 已安装并登录；可编辑连接配置后重试。")
     }
 }

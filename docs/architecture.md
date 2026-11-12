@@ -9,16 +9,12 @@ Orbit separates the Android interface from agent adapters and remote workspace s
 
 ## Agent adapters
 
-The connection editor's advanced settings offer **Codex** and **Codex compatible Agent**.
-The compatible option requires an explicit executable path and runs that binary with
-`app-server proxy`. Compatibility depends on its wire protocol and supported methods;
-being built with Codex or its SDK alone is insufficient. Deepseek and OpenCode
-have no dedicated adapter or verified compatibility in this repository.
-
 The app depends on these contracts in `core`:
 
-- `AgentEngine` / `AgentEngineRegistry`: select an adapter using the connection's stable
-  `engineId`; open and close its resources. Registration is compiled into the app.
+- `AgentEngine` / `AgentEngineRegistry`: discover `codex` and `traex` on the final SSH
+  target and open their adapters. Registration is compiled into the app.
+- `MultiAgentRepository`: aggregate host projects and ordered conversation pages; route
+  each conversation, event, approval and settings request to its owning adapter.
 - `AgentRepository`: projects, conversations, history, sending, settings and replies.
   Settings changes and review targets are semantic Kotlin types.
 - `AgentEvent` / `TimelineUpdate`: normalized messages, turn lifecycle, usage and typed
@@ -28,21 +24,29 @@ The app depends on these contracts in `core`:
   `SshWorkspace` supplies shared host services; `CodexFiles` owns native file RPC.
 - `AgentTools`: file search, skills, MCP and plugins; native RPC stays in `CodexTools`.
 
-To support a compatible fork with its own name, register
-`CodexEngine(EngineDescriptor("my-fork", "My Fork", requiresExecutable = true))`
-in `AgentEngines.default`. For a different protocol, implement `AgentEngine` and
-`AgentRepository`, translate its events and settings, then register the engine.
-The engine factory owns its transport; it need not use SSH or JSON-RPC. The current
-workspace contract includes the existing tools and review workflows, so a new adapter
-must implement or explicitly reject unsupported operations rather than fake success.
-The connection form currently stores SSH credentials and an executable path; protocols
-requiring other credentials need corresponding form/storage support.
+Codex and traex use the same compatible app-server protocol adapter. Binaries are
+found in the remote login PATH and standard installation locations; the connection
+form contains no engine selector or executable field. For a different protocol,
+implement `AgentEngine` and `AgentRepository` and add automatic discovery support.
 
-Existing saved profiles default to `engineId = "codex"`. The serialized `codexPath`
-field, application ID, vault keys, RPC client ID and upload/cache paths are retained.
-Changing the engine or executable clears the active workspace rather than resuming
-threads against a different backend. Use separate saved connections for separate agents.
-Unknown or duplicate engine IDs fail explicitly; no fallback starts an unrelated agent.
+The traex connection runs `app-server daemon start` before opening the proxy.
+This reuses an existing daemon and keeps daemon startup output on stderr so the
+WebSocket stream stays clean. Disconnecting Orbit closes only its proxy connection;
+it never stops or restarts the shared service. Conversations owned by an embedded
+server still need to be resumed through that same shared daemon on the desktop.
+
+New conversations default to Codex when available, otherwise traex. The selected
+engine is fixed at creation. Project lists combine conversations from both engines,
+with independent backend cursors and a globally ordered merge. Model and tool
+catalogs are requested from the conversation's engine.
+
+Existing saved profiles retain `engineId` and `codexPath` for serialization compatibility;
+production discovery no longer uses those connection-level choices. Old conversations
+without engine metadata belong to Codex and retain their original IDs. traex IDs use
+an adapter-boundary namespace, removed before RPC calls. Approval IDs carry the
+engine and original JSON ID, preventing cross-engine replies. An unavailable engine
+never causes its conversations to resume against another backend. Application ID,
+vault keys, RPC client ID and existing upload/cache paths are retained.
 
 ## SSH routing
 
@@ -53,3 +57,13 @@ The connection editor offers three modes. They apply to both the Codex proxy and
 - **SSH alias on A**: enter A as the connection address and B's alias (or `user@B`) as the remote target. A runs its own OpenSSH with `BatchMode=yes` and strict host-key checks, using its existing config, ProxyJump rules, identities and known_hosts. B must already be trusted and reachable without a prompt from A.
 
 **Import SSH config** imports a portable `Host` config file from the phone, resolves a selected alias, and expands `HostName`, `User`, `Port` and `ProxyJump` into editable connection fields. Wildcards, negations, comments, quotes and inherited defaults are supported. Imported `IdentityFile` paths are hints only: select the corresponding private keys on the phone for the target and each hop. `Include`, `Match` and `ProxyCommand` are rejected with a message rather than silently bypassed; expand them first or use A's remote SSH alias mode.
+
+## Task tracking
+
+Host workspaces retain followed conversation subscriptions independently of whether their
+reading tab is open. Saved records keep `tabOpen`, `tracked`, and turn-specific acceptance;
+missing fields preserve legacy open tabs and follow records with a known turn. The app
+coordinator exposes open `sessionTabs` and all retained `taskRecords` separately. Reconnect
+restores both, and task readiness remains false until history has been reconciled.
+Notification delivery is deduplicated by host, conversation, turn/outcome or request ID in
+encrypted local storage. No phone connection or notification implies remote execution state.

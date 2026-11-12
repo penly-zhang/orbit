@@ -5,9 +5,54 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import org.junit.Test
+import java.nio.file.Files
 import kotlin.test.*
 
 class AgentEngineTest {
+    @Test fun `traex starts its shared service before proxy and keeps startup output off the wire`() {
+        val root = Files.createTempDirectory("orbit-shared-service").toFile()
+        try {
+            val agent = root.resolve("agent with spaces")
+            agent.writeText("""#!/bin/sh
+printf '%s\n' "${'$'}*" >> "${'$'}PROBE_CALLS"
+if [ "${'$'}*" = 'app-server daemon start' ]; then
+    echo 'daemon startup log'
+    exit "${'$'}{PROBE_START_EXIT:-0}"
+fi
+if [ "${'$'}*" = 'app-server proxy' ]; then printf 'websocket bytes'; exit 0; fi
+exit 99
+""")
+            assertTrue(agent.setExecutable(true))
+            fun run(exit: Int): Triple<Int, String, String> {
+                val process = ProcessBuilder("sh", "-c", "agent_bin=${shellQuote(agent.path)}; ${agentProxyInvocation("traex")}").apply {
+                    environment()["PROBE_CALLS"] = root.resolve("calls").path
+                    environment()["PROBE_START_EXIT"] = exit.toString()
+                    redirectOutput(root.resolve("stdout"))
+                    redirectError(root.resolve("stderr"))
+                }.start()
+                if (!process.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)) {
+                    process.destroyForcibly()
+                    error("Shared service command did not finish")
+                }
+                val output = root.resolve("stdout").readText()
+                val errors = root.resolve("stderr").readText()
+                return Triple(process.waitFor(), output, errors)
+            }
+            val success = run(0)
+            assertEquals(0, success.first)
+            assertEquals("websocket bytes", success.second)
+            assertTrue(success.third.contains("daemon startup log"))
+            assertEquals(listOf("app-server daemon start", "app-server proxy"), root.resolve("calls").readLines())
+            root.resolve("calls").writeText("")
+            val failed = run(7)
+            assertNotEquals(0, failed.first)
+            assertEquals("", failed.second)
+            assertEquals(listOf("app-server daemon start"), root.resolve("calls").readLines())
+            assertTrue(failed.third.contains("共享后台"))
+            assertFalse(agentProxyInvocation("codex").contains("daemon"))
+        } finally { root.deleteRecursively() }
+    }
+
     @Test fun `old profiles default to Codex and preserve serialized fields`() {
         val old = """{"id":"saved-host","host":"air","codexPath":"/custom/codex","remoteTarget":"work"}"""
         val profile = json.decodeFromString<HostProfile>(old)
@@ -19,18 +64,19 @@ class AgentEngineTest {
         assertEquals("codex-compatible", changed.engineId)
     }
 
-    @Test fun `compatible agents require an explicit binary and preserve shell quoting`() {
-        val profile = HostProfile(engineId = "codex-compatible")
-        val engine = AgentEngines.default.engine(profile.engineId) as CodexEngine
-        assertFailsWith<IllegalArgumentException> { engine.command(profile) }
-        val command = engine.command(profile.copy(codexPath = "/opt/my agent/bin/fork"))
-        assertTrue(command.contains("app-server proxy"))
-        assertFalse(command.contains("command -v codex"))
-        assertTrue(command.contains("/opt/my agent/bin/fork"))
+    @Test fun `supported agents discover their own binary and ignore legacy path overrides`() {
+        assertEquals(listOf("codex", "traex"), AgentEngines.default.descriptors.map { it.id })
+        for (id in listOf("codex", "traex")) {
+            val engine = AgentEngines.default.engine(id) as CodexEngine
+            val command = engine.command(HostProfile(codexPath = "/obsolete/custom-agent"))
+            assertTrue(command.contains("command -v $id"))
+            assertTrue(command.contains("app-server proxy"))
+            assertFalse(command.contains("/obsolete/custom-agent"))
+        }
     }
 
     @Test fun `registry rejects missing and duplicate adapters`() = runBlocking<Unit> {
-        assertFailsWith<IllegalStateException> { AgentEngines.default.open(HostProfile(engineId = "unknown"), Credentials(), this) }
+        assertFailsWith<IllegalStateException> { AgentEngines.default.engine("unknown") }
         assertFailsWith<IllegalArgumentException> { AgentEngineRegistry(listOf(CodexEngine(), CodexEngine())) }
     }
 

@@ -27,7 +27,7 @@ import java.io.File
 internal class ProductUiProbe(private val runner: Instrumentation) {
     private val automation get() = runner.uiAutomation
     private var stage = "start"
-    fun run(projectsOnly: Boolean = false, homeOnly: Boolean = false, toolsOnly: Boolean = false, gesturesOnly: Boolean = false) {
+    fun run(projectsOnly: Boolean = false, homeOnly: Boolean = false, toolsOnly: Boolean = false, gesturesOnly: Boolean = false, connectionsOnly: Boolean = false) {
         var activity: MainActivity? = null; val result = Bundle()
         try {
             activity = runner.startActivitySync(Intent(runner.targetContext, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)) as MainActivity
@@ -44,6 +44,58 @@ internal class ProductUiProbe(private val runner: Instrumentation) {
                 pinThread = { projectId, id, pinned -> val ids = state.value.pinnedThreads[projectId].orEmpty().filterNot { it == id }; state.value = state.value.copy(pinnedThreads = state.value.pinnedThreads + (projectId to if (pinned) listOf(id) + ids else ids)) })
             var theme by mutableStateOf("light")
             fun show(content: @Composable () -> Unit) = runner.runOnMainSync { screen.setContent { PocketTheme(theme) { Surface(Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize().safeDrawingPadding()) { content() } } } } }
+            if (connectionsOnly) {
+                stage = "connection validation"
+                var saved = false
+                show { HostEditor(HostProfile(name = ""), Credentials(), {}, saveOnly = { _, _, _ -> saved = true }) { _, _, _ -> saved = true } }
+                tap("连接并检查")
+                await { find("请检查以下信息") != null }
+                check(!saved)
+                screenshot("connection-validation.png")
+                stage = "save without credentials"
+                show { HostEditor(profile, Credentials(), {}, saveOnly = { _, _, _ -> saved = true }) { _, _, _ -> } }
+                tap("保存修改"); check(saved)
+                stage = "unsaved form protection"
+                var closed = false
+                show { HostEditor(profile, Credentials(), { closed = true }, saveOnly = { _, _, _ -> }) { _, _, _ -> } }
+                runner.waitForIdleSync(); Thread.sleep(400)
+                await { edit() != null }
+                check(requireNotNull(edit()).performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "changed.example") }))
+                await { edit()?.text?.toString() == "changed.example" }
+                runner.waitForIdleSync()
+                stage = "unsaved first back"
+                tap("返回编辑连接")
+                stage = "unsaved confirmation"
+                await { find("放弃未保存的修改？") != null }
+                check(!closed); tap("继续编辑"); check(!closed)
+                stage = "unsaved second back"
+                tap("返回编辑连接")
+                stage = "unsaved discard"
+                tap("放弃修改"); check(closed)
+                stage = "settings visible actions"
+                val vm = androidx.lifecycle.ViewModelProvider(screen)[PocketViewModel::class.java]
+                var detailOpened = false
+                show { SettingsScreen(state.value, vm, {}, { detailOpened = true }) }
+                await { find("电脑与连接") != null && find("管理 Air") != null }
+                screenshot("connection-settings.png")
+                tap("查看详情"); check(detailOpened)
+                tap("管理 Air"); await { find("编辑配置") != null && find("删除电脑") != null }
+                stage = "connection detail"
+                show { ConnectionDetails(profile, HostConnectionStatus(connected = true, availableEngines = listOf("codex", "traex")), vm, {}, {}, {}) }
+                await { find("开始新会话") != null && find("可用 Agent") != null }
+                screenshot("connection-detail.png")
+                stage = "large connection form"
+                show { val d = LocalDensity.current; CompositionLocalProvider(LocalDensity provides Density(d.density, 2f)) { HostEditor(profile, Credentials(), {}, saveOnly = { _, _, _ -> }) { _, _, _ -> } } }
+                await { find("保存修改") != null }
+                val saveBounds = Rect(); requireNotNull(find("保存修改")).getBoundsInScreen(saveBounds)
+                check(saveBounds.width() > 0 && saveBounds.right <= runner.targetContext.resources.displayMetrics.widthPixels)
+                screenshot("connection-large-text.png")
+                runner.runOnMainSync { theme = "dark" }
+                show { HostEditor(profile, Credentials(), {}, saveOnly = { _, _, _ -> }) { _, _, _ -> } }
+                await { find("编辑连接") != null }; screenshot("connection-dark.png")
+                result.putString("stream", "PASS: connection validation, save without credentials, unsaved changes guard, visible management, connection detail, 200% text and dark form; fixture-only actions\n")
+                return
+            }
             if (gesturesOnly) {
                 stage = "bidirectional session gestures"
                 var index by mutableIntStateOf(1)
@@ -106,11 +158,12 @@ internal class ProductUiProbe(private val runner: Instrumentation) {
                 val home = mutableStateOf(state.value.copy(connected = false, newConversationDraft = ""))
                 var browsing by mutableStateOf(false)
                 var sends = 0
+                var sentEngine = ""
                 show {
                     if (browsing) Column(Modifier.fillMaxSize().sessionSwipe("home-project-list") { if (it > 0) browsing = false }) {
                         TextButton(onClick = { browsing = false }) { Text("返回会话") }
                         Box(Modifier.weight(1f)) { ProjectsScreen(state.value, actions, {}, allowArchiveSwipe = false) }
-                    } else NewConversationContent(home.value, { home.value = home.value.copy(newConversationDraft = it) }, { sends++ }, {}, {}, { browsing = true })
+                    } else NewConversationContent(home.value, { home.value = home.value.copy(newConversationDraft = it) }, { sends++; sentEngine = home.value.newConversationEngine }, {}, {}, { browsing = true }, { home.value = home.value.copy(newConversationEngine = it) })
                 }
                 await { find("开始一个新任务") != null && edit() != null }; screenshot("home-empty.png")
                 requireNotNull(edit()).performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "保留主界面草稿") })
@@ -129,10 +182,13 @@ internal class ProductUiProbe(private val runner: Instrumentation) {
                 tap("查看已有会话"); await { browsing }
                 swipe(width * 0.8f, width * 0.2f, height * 0.4f)
                 await { !browsing && edit()?.text?.toString() == "保留主界面草稿" }
-                runner.runOnMainSync { home.value = home.value.copy(connected = true) }
-                tap("发送"); check(sends == 1)
+                runner.runOnMainSync { home.value = home.value.copy(connected = true, availableEngines = listOf("codex", "traex")) }
+                await { find("Codex") != null && find("traex") != null }
+                check(home.value.newConversationEngine == "codex")
+                tap("traex"); await { home.value.newConversationEngine == "traex" }
+                tap("发送"); check(sends == 1 && sentEngine == "traex")
                 screenshot("home-draft.png")
-                result.putString("stream", "PASS: empty conversation home, offline editing and send guard, no swipe navigation from empty home, explicit list entry and left swipe return, draft preservation; fixture-only actions\n")
+                result.putString("stream", "PASS: empty conversation home, offline editing and send guard, no swipe navigation from empty home, explicit list entry and left swipe return, draft preservation, default Codex and explicit traex selection; fixture-only actions\n")
                 return
             }
             stage = "project scope"; show { ProjectsScreen(state.value, actions, {}) }

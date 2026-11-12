@@ -9,9 +9,10 @@ Orbit is in active development. The current integration supports Codex app-serve
 ## Features
 
 - **Multiple computers, one workspace.** Keep independent SSH connections, browse projects, and switch conversations without losing drafts or reading position.
-- **Agent conversations.** Stream replies and tool activity, send images and file references, queue follow-up messages, and respond to approval requests. Model, reasoning, and permission options reflect the connected engine's capabilities.
-- **Project files and previews.** Browse files, read code and Markdown, view images, and preview HTML/SVG results. Open development servers through SSH tunnels.
+- **Agent conversations.** Stream replies and tool activity, send images and file references (including the first message), queue follow-up messages, and respond to approval requests. Model, reasoning, and permission options reflect the connected engine's capabilities.
+- **Project files and previews.** Browse files, read code and Markdown, view images, and preview HTML/SVG results. Mermaid code fences and `.mmd` / `.mermaid` files render locally with source and fullscreen views; no CDN connection is required. Open development servers through SSH tunnels.
 - **Code review.** Inspect staged and unstaged changes, add file or line comments, and send feedback to a conversation. Browsing and commenting do not modify or commit files.
+- **Task follow-through.** A cross-computer task center groups followed conversations into attention, running, awaiting acceptance, and history. Tasks sent from Orbit are followed automatically; existing conversations can be followed explicitly. Closing a tab keeps followed tasks subscribed and restores their state after reconnection. Inspect the latest reply and task changes, continue with feedback, and explicitly accept a completed turn locally. Connection loss is shown as unverified task state rather than completion.
 - **Session continuity.** Restore tabs and drafts, reconnect after interruptions, and optionally keep connections alive with an Android foreground service.
 - **SSH routing.** Use direct connections, jump hosts, remote SSH aliases, or a SOCKS5 proxy. Verify and pin host keys for each connection.
 
@@ -26,12 +27,14 @@ Android phone                 Your computer
 └──────────────────┘         └──────────────────────────┘
 ```
 
-The current adapter connects to an existing Codex app-server through `codex app-server proxy`. The engine runs on the computer and determines available models, tools, and permissions. Orbit does not require an OpenAI API key on the phone.
+Orbit automatically discovers `codex` and `traex` on the connected computer and uses their compatible `app-server proxy` interfaces. New conversations default to Codex when both are available; the chosen agent stays fixed for the conversation. Each project lists conversations from both agents. The engine runs on the computer and determines available models, tools, and permissions. Orbit does not require an OpenAI API key on the phone.
+
+For traex, Orbit starts the shared App Server daemon when needed and connects through its proxy. Desktop terminals and Orbit can attach to the same conversation when they use the same daemon, OS account, and `TRAE_HOME`. On TRAE CLI 0.214.1, enable shared TUI mode with `traex features enable daemon_auto_start`, then reopen the terminal conversation with `traex resume <session-id>` (without `--no-daemon`). For a single invocation, use `traex --enable daemon_auto_start resume <session-id>`. Starting the daemon alone does not switch a terminal into shared mode. A conversation owned by a separate embedded process must first be closed there and resumed through the shared daemon; Orbit does not stop that process or fork the conversation automatically. Shared-session attachment was verified with TRAE CLI 0.214.1; older versions require verification.
 
 ## Requirements
 
 - **Phone:** Android 8.0 or later (API 26+).
-- **Computer:** an SSH server, Git for review features, and a running, authenticated Codex app-server.
+- **Computer:** an SSH server, Git for review features, and a running, authenticated Codex or traex app-server.
 - **Connectivity:** the phone must be able to reach the computer, directly or through a configured VPN, proxy, or SSH route.
 - **Development server previews:** Python 3 on the destination computer for loopback HTTP tunneling.
 
@@ -120,9 +123,11 @@ Keep personal connection details, local paths, and operational notes in the igno
 
 - Other agent protocols do not yet have dedicated adapters. A fork being built with Codex or its SDK does not establish compatibility.
 - Official cloud relay/QR pairing, voice sessions, scheduled tasks, and cloud push delivery are not implemented.
-- Background connections depend on Android process and network availability. Notifications are not guaranteed after a force-stop.
+- Background connections depend on Android process and network availability. Notifications are not guaranteed after a force-stop. Reconnection checks followed tasks and restores attention items; delivered task/approval reminders are deduplicated locally.
+- Enable task reminders in Settings to also enable background synchronization. While Orbit is in the background, task completion, approvals and questions use system notifications with conversation shortcuts. New installs request a high-importance notification channel; existing installs retain system preferences. Use the channel and app notification settings links to enable banners (some Android variants have both switches).
 - File workflows focus on browsing, previews, references, and review; a general-purpose file editor and Git staging/commit interface are not included.
-- Searches cover loaded and cached content rather than all remote history. Sharing and export include loaded messages.
+- Search initially covers loaded messages; load the current conversation’s full history from message search to expand coverage. Loading is bounded to 500 pages / approximately 10,000 items per operation. Search across all remote conversations is not included. Sharing and export include loaded messages and label their scope.
+- Task attention covers Orbit-initiated or explicitly followed conversations and pending requests, not every remote task. Result pages collect links from the final reply and show possible verification commands from the loaded turn, with output and exit codes when available; this is evidence to inspect, not automatic certification. Acceptance is a local record of a specific turn; it does not certify tests, commit files, or deploy.
 - Local HTTPS development servers are not tunneled. Use an HTTP development URL for SSH preview tunneling.
 
 ## Contributing

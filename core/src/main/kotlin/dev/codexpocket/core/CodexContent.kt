@@ -33,7 +33,7 @@ fun chatItem(record: JsonObject): ChatItem? {
         "contextCompaction" -> "已整理上下文"
         else -> return null
     }
-    return ChatItem(record.text("id"), type, text, record.text("status"), phase = record.text("phase"), command = record.text("command"), images = images)
+    return ChatItem(record.text("id"), type, text, record.text("status"), phase = record.text("phase"), command = record.text("command"), images = images, exitCode = record.text("exitCode").toIntOrNull())
 }
 
 fun historyPage(turns: List<JsonObject>, cursor: String?): HistoryPage = HistoryPage(
@@ -45,7 +45,7 @@ fun historyPage(turns: List<JsonObject>, cursor: String?): HistoryPage = History
         turn.array("items").mapNotNull { (it as? JsonObject)?.let(::chatItem)?.copy(
             turnId = turn.text("id"), turnStartedAtMs = started, turnCompletedAtMs = completed, turnDurationMs = duration,
         ) }
-    }, cursor, turns.lastOrNull { it.text("status") == "inProgress" }?.text("id"))
+    }, cursor, turns.lastOrNull { it.text("status") == "inProgress" }?.text("id"), turns.lastOrNull()?.let(::turnSummary))
 
 internal fun isUnmaterializedHistory(error: RpcError) = error.message.contains("not materialized yet", ignoreCase = true)
     && error.message.contains("before first user message", ignoreCase = true)
@@ -59,6 +59,8 @@ fun itemHistoryPage(entries: List<JsonObject>, turns: List<JsonObject>, cursor: 
             turnStartedAtMs = turn?.get("startedAt")?.jsonPrimitive?.longOrNull?.times(1000),
             turnCompletedAtMs = turn?.get("completedAt")?.jsonPrimitive?.longOrNull?.times(1000),
             turnDurationMs = turn?.get("durationMs")?.jsonPrimitive?.longOrNull)
-    }, cursor, turns.firstOrNull { it.text("status") == "inProgress" }?.text("id"))
+    }, cursor, turns.firstOrNull { it.text("status") == "inProgress" }?.text("id"), turns.firstOrNull()?.let(::turnSummary))
 }
 
+
+private fun turnSummary(turn: JsonObject) = TurnSummary(turn.text("id"), turn.text("status"), turn.objectAt("error").text("message").takeIf(String::isNotBlank))

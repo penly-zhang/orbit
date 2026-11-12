@@ -70,6 +70,8 @@ class MainActivity : ComponentActivity() {
 @Composable fun PocketApp(vm: PocketViewModel = viewModel()) {
     val s by vm.state.collectAsStateWithLifecycle()
     var editHost by remember { mutableStateOf<HostProfile?>(null) }
+    var connectionDetails by rememberSaveable { mutableStateOf<String?>(null) }
+    var taskCenter by rememberSaveable { mutableStateOf(false) }
     var review by remember { mutableStateOf(false) }
     var settings by rememberSaveable { mutableStateOf(false) }
     var projectMenu by rememberSaveable { mutableStateOf(false) }
@@ -101,8 +103,8 @@ class MainActivity : ComponentActivity() {
         topBar = {
             TopAppBar(expandedHeight = if (showingConversation && !settings) 40.dp else if (showingProjects && !settings) 56.dp else 64.dp, title = {
                 Column {
-                    Text(if (settings) "设置" else if (showingProjects) "项目与会话" else if (showingConversation && s.thread != null) s.thread!!.title else if (s.project != null && s.tab != 0) s.project!!.name else if (showingConversation) "新会话" else "Orbit", fontWeight = if (showingConversation) FontWeight.SemiBold else FontWeight.Bold, fontSize = if (showingConversation) 17.sp else 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (!showingConversation && (settings || !showingProjects)) Text(if (settings) "${s.connections.values.count { it.connected }} 台电脑已连接" else if (s.reconnecting) "连接中断，正在自动重连 · 第 ${s.reconnectAttempt} 次" else if (s.connecting) "正在建立 SSH 连接…" else if (s.connected) "● ${s.project?.name?.let { "$it · " }.orEmpty()}${s.profile?.name} · SSH" else s.profile?.let { "${it.name} · 已断开" } ?: "你的项目，随身继续", maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp, color = if (s.connected) Mint else MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(if (settings) "设置" else if (showingProjects) "项目与会话" else if (showingConversation && s.thread != null) "${agentLabel(s.thread!!.engineId)} · ${s.thread!!.title}" else if (s.project != null && s.tab != 0) s.project!!.name else if (showingConversation) "新会话" else "Orbit", fontWeight = if (showingConversation) FontWeight.SemiBold else FontWeight.Bold, fontSize = if (showingConversation) 17.sp else 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (settings || (!showingConversation && !showingProjects)) Text(if (settings) "${s.connections.values.count { it.connected }} 台电脑已连接" else if (s.reconnecting) "连接中断，正在自动重连 · 第 ${s.reconnectAttempt} 次" else if (s.connecting) "正在建立 SSH 连接…" else if (s.connected) "● ${s.project?.name?.let { "$it · " }.orEmpty()}${s.profile?.name} · SSH" else s.profile?.let { "${it.name} · 已断开" } ?: "你的项目，随身继续", maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp, color = if (s.connected) Mint else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }, navigationIcon = {
                 IconButton(onClick = ::navigateBack, modifier = Modifier.size(if (showingConversation && !settings) 40.dp else 48.dp)) {
@@ -111,6 +113,7 @@ class MainActivity : ComponentActivity() {
                 }
             }, actions = {
                 if (!settings) {
+                    IconButton(onClick = { taskCenter = true }) { BadgedBox(badge = { val count = attentionTasks(s).size + s.pending.count { p -> followedTasks(s).none { it.profileId == p.profileId && it.thread.id == p.params.text("threadId") } }; if (count > 0) Badge { Text(count.toString()) } }) { Icon(Icons.Outlined.PendingActions, "任务中心") } }
                     if (showingConversation || showingProjects) IconButton(onClick = vm::newConversation, enabled = !s.creatingConversation) { Icon(Icons.Outlined.Add, "新建会话") }
                     if (showingConversation && s.thread != null) key(s.profile?.id, s.thread?.id) { ConversationActions(s, vm, searching) { searching = !searching } }
                     if (!showingProjects && !showingConversation) Box {
@@ -136,7 +139,7 @@ class MainActivity : ComponentActivity() {
                 HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
             }
             when {
-                settings -> SettingsScreen(s, vm, { editHost = it })
+                settings -> SettingsScreen(s, vm, { editHost = it }, { connectionDetails = it.id })
                 showingProjects -> Box(Modifier.fillMaxSize().sessionSwipe("project-navigation") { if (it > 0) vm.returnToConversation() }) {
                     ProjectsScreen(s, vm, { settings = true }, allowArchiveSwipe = false)
                 }
@@ -162,8 +165,18 @@ class MainActivity : ComponentActivity() {
         }
     }
     }
+    if (taskCenter) TaskCenter(s, vm, { requestId = it.profileId to it.id }, { taskCenter = false })
     WebPreviewDialog(vm)
-    editHost?.let { profile -> HostEditor(profile, vm.storedCredentials(profile.id), onDismiss = { editHost = null }) { updated, secret, remember -> editHost = null; vm.saveAndConnect(updated, secret, remember) } }
+    connectionDetails?.let { id -> s.profiles.find { it.id == id }?.let { profile ->
+        ConnectionDetails(profile, s.connections[id] ?: HostConnectionStatus(), vm,
+            close = { connectionDetails = null }, edit = { editHost = profile },
+            start = { vm.selectHost(id); vm.newConversation(); connectionDetails = null; settings = false })
+    } }
+    editHost?.let { profile -> HostEditor(profile, vm.credentialsForEditing(profile.id), onDismiss = { editHost = null },
+        initialRememberSecret = vm.storedCredentials(profile.id) != Credentials(),
+        saveOnly = { updated, secret, remember -> vm.saveAndConnect(updated, secret, remember, false); editHost = null; connectionDetails = updated.id }) { updated, secret, remember ->
+        vm.saveAndConnect(updated, secret, remember, true); editHost = null; connectionDetails = updated.id
+    } }
     s.trust?.let { identity ->
         AlertDialog(onDismissRequest = vm::dismissTrust, icon = { Icon(Icons.Outlined.VerifiedUser, null) },
             title = { Text(if (identity.changed) "主机密钥发生变化" else "确认这台电脑") },
@@ -185,6 +198,7 @@ class MainActivity : ComponentActivity() {
     val lineHeightPx = with(density) { 27.sp.toPx() }
     val paragraphGapPx = with(density) { 12.dp.roundToPx() }
     val openFile = LocalOpenProjectFile.current
+    val currentOpenFile by rememberUpdatedState(openFile)
     val textColor = Ink.toArgb()
     val linkColor = Mint.toArgb()
     val codeColor = MaterialTheme.colorScheme.surfaceContainer.toArgb()
@@ -192,12 +206,13 @@ class MainActivity : ComponentActivity() {
         override fun configureTheme(builder: io.noties.markwon.core.MarkwonTheme.Builder) { builder.codeTextColor(textColor).codeBlockTextColor(textColor).codeBackgroundColor(codeColor).codeBlockBackgroundColor(codeColor).linkColor(linkColor).blockMargin(paragraphGapPx) }
     }).build() }
     AndroidView(factory = { ctx -> TextView(ctx).apply { textSize = 16f; includeFontPadding = false; setTextIsSelectable(true); movementMethod = android.text.method.LinkMovementMethod.getInstance() } }, update = { view ->
+        val renderKey = listOf(text, markwon, lineHeightPx, openFile != null)
+        if (view.tag == renderKey) return@AndroidView
         // TextView spacing is in physical pixels. Match Compose's scaled 27sp baseline rhythm.
         view.setLineSpacing((lineHeightPx - view.paint.fontSpacing).coerceAtLeast(0f), 1f)
         view.setTextColor(textColor); view.setLinkTextColor(linkColor)
-        markwon.setMarkdown(view, text)
+        val content = android.text.SpannableStringBuilder(markwon.toMarkdown(text))
         if (openFile != null) {
-            val content = android.text.SpannableStringBuilder(view.text)
             val matcher = android.util.Patterns.WEB_URL.matcher(content)
             while (matcher.find()) {
                 if (content.getSpans(matcher.start(), matcher.end(), android.text.style.URLSpan::class.java).isEmpty()) {
@@ -209,93 +224,14 @@ class MainActivity : ComponentActivity() {
                 if (isRemoteFileLink(span.url) || isWebLink(span.url)) {
                     val start = content.getSpanStart(span); val end = content.getSpanEnd(span)
                     content.removeSpan(span)
-                    content.setSpan(object : android.text.style.ClickableSpan() { override fun onClick(widget: android.view.View) { openFile(span.url) } }, start, end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    content.setSpan(object : android.text.style.ClickableSpan() { override fun onClick(widget: android.view.View) { currentOpenFile?.invoke(span.url) } }, start, end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
             }
-            view.text = content
         }
+        // Assign once, after link rewriting, and retain the layout for unchanged content.
+        markwon.setParsedMarkdown(view, content)
+        view.tag = renderKey
     }, modifier = Modifier.fillMaxWidth())
-}
-
-@Composable internal fun HostEditor(profile: HostProfile, secret: Credentials, onDismiss: () -> Unit, save: (HostProfile, Credentials, Boolean) -> Unit) {
-    var route by remember { mutableStateOf(profile) }
-    val selectedEngine = AgentEngines.default.descriptors.find { it.id == route.engineId }
-    var hopSecrets by remember { mutableStateOf(secret.jumps) }
-    var name by remember { mutableStateOf(profile.name) }
-    var host by remember { mutableStateOf(profile.host) }
-    var port by remember { mutableStateOf(profile.port.toString()) }
-    var username by remember { mutableStateOf(profile.username) }
-    var path by remember { mutableStateOf(profile.codexPath) }
-    var proxyEnabled by remember { mutableStateOf(profile.proxyEnabled) }
-    var autoConnect by remember { mutableStateOf(profile.autoConnect) }
-    var proxyHost by remember { mutableStateOf(profile.proxyHost) }
-    var proxyPort by remember { mutableStateOf(profile.proxyPort.toString()) }
-    var auth by remember { mutableStateOf(profile.authType) }
-    var password by remember { mutableStateOf(secret.password) }
-    var key by remember { mutableStateOf(secret.privateKey) }
-    var passphrase by remember { mutableStateOf(secret.passphrase) }
-    var rememberSecret by remember { mutableStateOf(secret.privateKey.isNotBlank() || secret.password.isNotBlank()) }
-    var advanced by remember { mutableStateOf(false) }
-    var importError by remember { mutableStateOf<String?>(null) }
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch {
-            runCatching { withContext(Dispatchers.IO) { context.contentResolver.openInputStream(uri)!!.use { input ->
-                val bytes = java.io.ByteArrayOutputStream()
-                val buffer = ByteArray(8192)
-                while (true) { val n = input.read(buffer); if (n < 0) break; require(bytes.size() + n <= 1024 * 1024) { "私钥文件过大" }; bytes.write(buffer, 0, n) }
-                bytes.toString("UTF-8")
-            } } }
-                .onSuccess { key = it; importError = null }.onFailure { importError = it.message }
-        }
-    }
-    FullPage(if (profile.host.isBlank()) "添加连接" else "编辑连接", onDismiss, bottom = {
-        Surface(color = Panel) { Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Button(modifier = Modifier.fillMaxWidth(), onClick = { save(route.copy(name = name.ifBlank { host }, host = host, port = port.toIntOrNull() ?: 0, username = username, codexPath = path, authType = auth, proxyEnabled = proxyEnabled, autoConnect = autoConnect, proxyHost = proxyHost, proxyPort = proxyPort.toIntOrNull() ?: 0), Credentials(password, key, passphrase, hopSecrets.filterKeys { id -> route.jumpHosts.any { it.id == id } }), rememberSecret) }, enabled = (selectedEngine != null && (!selectedEngine.requiresExecutable || path.isNotBlank())) && host.isNotBlank() && username.isNotBlank() && port.toIntOrNull() in 1..65535 && (!proxyEnabled || (proxyHost.isNotBlank() && proxyPort.toIntOrNull() in 1..65535)) && (route.routeMode != "remoteSsh" || route.remoteTarget.isNotBlank()) && route.jumpHosts.all { it.host.isNotBlank() && it.username.isNotBlank() && it.port in 1..65535 && (if (it.authType == "key") !hopSecrets[it.id]?.privateKey.isNullOrBlank() else !hopSecrets[it.id]?.password.isNullOrBlank()) } && (if (auth == "key") key.isNotBlank() else password.isNotBlank())) { Text(if (autoConnect) "保存并连接" else "保存") }
-        } }
-    }) {
-        Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text("连接信息", style = MaterialTheme.typography.titleSmall)
-            Text("通过 SSH 安全访问，任务在电脑上执行。", color = Muted, fontSize = 12.sp)
-                OutlinedTextField(name, { name = it }, label = { Text("名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("启用连接", fontSize = 14.sp); Text("保存后立即连接，断线自动重连", fontSize = 12.sp, color = Muted) }; Switch(autoConnect, { autoConnect = it }) }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(host, { host = it.trim() }, label = { Text("电脑地址") }, placeholder = { Text("电脑 IP 或主机名") }, singleLine = true, modifier = Modifier.weight(1f))
-                    OutlinedTextField(port, { port = it.filter(Char::isDigit) }, label = { Text("端口") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true, modifier = Modifier.width(88.dp))
-                }
-                OutlinedTextField(username, { username = it.trim() }, label = { Text("SSH 用户名") }, placeholder = { Text("username") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { FilterChip(auth == "password", { auth = "password" }, label = { Text("密码") }); FilterChip(auth == "key", { auth = "key" }, label = { Text("SSH 密钥") }) }
-                if (auth == "password") OutlinedTextField(password, { password = it }, label = { Text("SSH 登录密码") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
-                else {
-                    OutlinedButton(onClick = { launcher.launch(arrayOf("*/*")) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Outlined.Key, null); Text(if (key.isBlank()) "选择私钥文件" else "私钥已导入 · 重新选择") }
-                    OutlinedTextField(passphrase, { passphrase = it }, label = { Text("私钥口令（可选）") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
-                    if (importError != null) Text(importError!!, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(rememberSecret, { rememberSecret = it }); Text("加密保存登录信息", fontSize = 13.sp) }
-                TextButton(onClick = { advanced = !advanced }) { Text(if (advanced) "收起高级设置" else "高级设置：Agent、跳板与代理") }
-                if (advanced) {
-                SshRouteEditor(route.copy(host = host, port = port.toIntOrNull() ?: 22, username = username, authType = auth), hopSecrets, { updated ->
-                    route = updated; host = updated.host; port = updated.port.toString(); username = updated.username; auth = updated.authType
-                }, { hopSecrets = it })
-                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(proxyEnabled, { proxyEnabled = it }); Text("通过 SOCKS5 代理连接", fontSize = 13.sp) }
-                if (proxyEnabled) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(proxyHost, { proxyHost = it.trim() }, label = { Text("代理地址") }, singleLine = true, modifier = Modifier.weight(1f))
-                        OutlinedTextField(proxyPort, { proxyPort = it.filter(Char::isDigit) }, label = { Text("代理端口") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true, modifier = Modifier.width(100.dp))
-                    }
-                    Text("TailSocks Proxy 模式：填写其本地 SOCKS5 地址和端口。支持无认证代理；电脑地址仍填写电脑的 Tailscale IP。", fontSize = 12.sp, color = Muted)
-                }
-                Text("Agent 引擎", style = MaterialTheme.typography.titleSmall)
-                AgentEngines.default.descriptors.forEach { engine ->
-                    FilterChip(selected = route.engineId == engine.id, onClick = { route = route.copy(engineId = engine.id) }, label = { Text(engine.name) })
-                }
-                Text("兼容 Agent 需支持 Codex app-server proxy；其他协议暂未接入。", color = Muted, fontSize = 12.sp)
-                OutlinedTextField(path, { path = it }, label = { Text(if (selectedEngine?.requiresExecutable == true) "Agent 可执行文件（必填）" else "Agent 可执行文件（可选）") }, placeholder = { Text("自动查找，例如 ~/.local/bin/codex") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Text("连接前请在电脑上启动所选 Agent 的 app-server 服务。手机和电脑需处于可互通的网络；在外网可通过已有 VPN 访问。", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
-                }
-        }
-    }
 }
 
 @Composable private fun ReviewDialog(dismiss: () -> Unit, start: (ReviewTarget) -> Unit) {

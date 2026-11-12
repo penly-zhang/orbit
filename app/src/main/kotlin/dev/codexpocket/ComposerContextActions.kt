@@ -6,7 +6,7 @@ import java.net.URI
 
 internal fun composerContextActions(vm: PocketViewModel, state: PocketState, tab: SessionTab, picker: (String, Int) -> Unit): ContextActions {
     val profile = tab.profileId; val root = state.root; val thread = tab.thread.id
-    fun repo() = vm.contextRepository(profile)
+    fun repo() = vm.contextRepository(profile).forEngine(tab.thread.engineId)
     return ContextActions(
         addDocument = { picker(profile, tab.number) },
         add = { vm.addContext(profile, tab.number, it) }, remove = { vm.removeContext(profile, tab.number, it.id) },

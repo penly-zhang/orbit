@@ -5,8 +5,15 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.serialization.json.*
 
+/** The engine refused to attach because another process owns the conversation. */
+class ThreadInUseException(cause: Throwable) : IllegalStateException(
+    "此会话仍被另一个执行进程独占。多端接续需要连接同一个共享后台。若使用 traex，请先运行 traex features enable daemon_auto_start，再正常退出并重新打开电脑端会话，然后在 Orbit 重试。只启动后台不会切换已有终端。已保留本机消息和草稿。", cause)
+
 /** UI-facing contract. Adapters own protocol, settings encoding and request replies. */
 interface AgentRepository : WorkspaceRepository, AgentTools, Closeable {
+    val engineIssues: Map<String, String> get() = emptyMap()
+    val availableEngines: List<String> get() = listOf("codex")
+    fun forEngine(id: String): AgentRepository { require(id == "codex") { "Agent 不可用：$id" }; return this }
     val events: Flow<AgentEvent>
     val failure: StateFlow<String?>
     suspend fun initialize()
@@ -18,7 +25,7 @@ interface AgentRepository : WorkspaceRepository, AgentTools, Closeable {
     suspend fun models(): List<ModelOption>
     suspend fun permissions(cwd: String): List<PermissionOption>
     suspend fun updateSettings(id: String, change: SettingsChange): ConversationSettings
-    suspend fun projects(): List<ProjectInfo>
+    suspend fun projects(cached: List<ProjectInfo> = emptyList()): List<ProjectInfo>
     suspend fun threads(project: ProjectInfo, cursor: String? = null, archived: Boolean = false): Pair<List<ThreadInfo>, String?>
     suspend fun renameThread(id: String, name: String)
     suspend fun compactThread(id: String)

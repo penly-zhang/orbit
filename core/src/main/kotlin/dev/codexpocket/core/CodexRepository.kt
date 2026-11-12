@@ -3,6 +3,8 @@ package dev.codexpocket.core
 import kotlinx.serialization.json.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 class CodexRepository(private val rpc: RpcClient, private val ssh: SshConnection) :
@@ -41,6 +43,7 @@ class CodexRepository(private val rpc: RpcClient, private val ssh: SshConnection
     private val freshThreads = ConcurrentHashMap<String, Pair<ProjectInfo, ThreadInfo>>()
     private val settings = ConcurrentHashMap<String, ConversationSettings>()
     private val attached = ConcurrentHashMap.newKeySet<String>()
+    private val attachmentLocks = ConcurrentHashMap<String, Mutex>()
     override fun settings(id: String): ConversationSettings? = settings[id]
     override fun acceptSettings(id: String, value: ConversationSettings) { settings[id] = value }
     override fun forgetSubscription(id: String) { attached.remove(id) }
@@ -105,7 +108,7 @@ class CodexRepository(private val rpc: RpcClient, private val ssh: SshConnection
         } finally { updated.cancel() }
     }
     private val interactiveSources = listOf("cli", "vscode", "appServer")
-    override suspend fun projects(): List<ProjectInfo> {
+    override suspend fun projects(cached: List<ProjectInfo>): List<ProjectInfo> {
         val projects = mutableListOf<ProjectInfo>()
         try {
             var cursor: String? = null
@@ -115,11 +118,23 @@ class CodexRepository(private val rpc: RpcClient, private val ssh: SshConnection
                 cursor = page.text("nextCursor").takeIf(String::isNotBlank)
             } while (cursor != null && projects.size < 2000)
         } catch (error: RpcError) { if (error.code != -32601 && error.code != -32600) throw error }
-        val threads = rpc.request("thread/list", obj("limit" to 100, "useStateDbOnly" to true, "sourceKinds" to interactiveSources)).array("data")
-        return combineProjectSources(projects, threads.mapNotNull { it as? JsonObject })
+        val threads = rpc.request("thread/list", obj("limit" to 100, "useStateDbOnly" to true, "sourceKinds" to interactiveSources))
+            .array("data").mapNotNull { it as? JsonObject }
+        val directories = (threads.map { it.text("cwd") } + cached.filter { it.id.startsWith("cwd:") }.flatMap { it.threadCwds } + projects.flatMap { it.roots })
+            .filter { it.startsWith('/') && it.none(Char::isISOControl) }.distinct()
+        val roots = mutableMapOf<String, String>()
+        try {
+            // Bound individual command size, including cached history outside the recent-thread window.
+            directories.chunked(100).forEach { batch ->
+                val result = ssh.execute(projectRootsCommand(batch))
+                if (result.code == 0) roots.putAll(parseProjectRoots(result.stdout))
+            }
+        } catch (cancel: CancellationException) { throw cancel }
+        catch (_: Exception) { /* Project navigation remains usable if remote Git is unavailable. */ }
+        return combineProjectSources(projects, threads, roots, cached)
     }
     override suspend fun threads(project: ProjectInfo, cursor: String?, archived: Boolean): Pair<List<ThreadInfo>, String?> {
-        val params = if (project.id.startsWith("cwd:")) obj("cwd" to project.roots, "limit" to 30, "cursor" to cursor, "useStateDbOnly" to true, "sortKey" to "updated_at", "sourceKinds" to interactiveSources)
+        val params = if (project.id.startsWith("cwd:")) obj("cwd" to project.threadCwds, "limit" to 30, "cursor" to cursor, "useStateDbOnly" to true, "sortKey" to "updated_at", "sourceKinds" to interactiveSources)
         else obj("projectId" to project.id, "limit" to 30, "cursor" to cursor, "useStateDbOnly" to true, "sortKey" to "updated_at", "sourceKinds" to interactiveSources)
         val page = rpc.request("thread/list", JsonObject(params + ("archived" to JsonPrimitive(archived))))
         val fresh = if (cursor == null && !archived) freshThreads.values.filter { it.first.id == project.id }.map { it.second } else emptyList()
@@ -128,10 +143,17 @@ class CodexRepository(private val rpc: RpcClient, private val ssh: SshConnection
     override fun forgetThread(id: String) { freshThreads.remove(id); attached.remove(id); settings.remove(id) }
     override suspend fun archiveThread(id: String) { rpc.request("thread/archive", obj("threadId" to id)); forgetThread(id) }
     override suspend fun unarchiveThread(id: String) { rpc.request("thread/unarchive", obj("threadId" to id)); forgetThread(id) }
-    override suspend fun attachThread(id: String): ConversationSettings {
-        if (freshThreads.containsKey(id) || id in attached) settings[id]?.let { return it }
+    override suspend fun attachThread(id: String): ConversationSettings = attachmentLocks.getOrPut(id) { Mutex() }.withLock {
+        if (freshThreads.containsKey(id) || id in attached) settings[id]?.let { return@withLock it }
         // Join an already-running thread without changing its runtime permissions or model.
-        return conversationSettings(rpc.request("thread/resume", obj("threadId" to id, "excludeTurns" to true))).also { settings[id] = it; attached += id }
+        val response = try { rpc.request("thread/resume", obj("threadId" to id, "excludeTurns" to true)) }
+        catch (error: RpcError) {
+            if (error.message.contains("thread-store conflict:") && error.message.contains("already has an active writer")) {
+                throw ThreadInUseException(error)
+            }
+            throw error
+        }
+        conversationSettings(response).also { settings[id] = it; attached += id }
     }
     /** An empty, never-sent thread may have no resumable history after transport loss. */
     override suspend fun reconnectThread(thread: ThreadInfo, project: ProjectInfo, replaceMissingEmpty: Boolean): Pair<ThreadInfo, ConversationSettings> {

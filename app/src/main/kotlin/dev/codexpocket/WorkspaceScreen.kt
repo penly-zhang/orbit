@@ -95,7 +95,10 @@ import java.util.Locale
     val filters = listOf("all" to "全部", "opened" to "已打开", "running" to "运行中", "unread" to "未读", "pending" to "待确认")
     val rows = projectNavigationRows(s, search, filter)
     var threadMenu by remember { mutableStateOf<String?>(null) }
-    var projectInfo by remember { mutableStateOf<ProjectInfo?>(null) }
+    var projectInfo by remember(s.profile?.id) { mutableStateOf<ProjectInfo?>(null) }
+    var removingProject by remember(s.profile?.id) { mutableStateOf<ProjectInfo?>(null) }
+    var sortingProjects by rememberSaveable(s.profile?.id) { mutableStateOf(false) }
+    var creatingProject by remember(s.profile?.id) { mutableStateOf(false) }
     var renaming by remember(s.profile?.id) { mutableStateOf<ThreadInfo?>(null) }
     var threadName by remember { mutableStateOf("") }
     LazyColumn(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -122,6 +125,8 @@ import java.util.Locale
         item(key = "projectsLabel") { Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(if (s.showArchived) "已归档" else if (filter == "all") "项目" else "项目 · ${filters.first { it.first == filter }.second}", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
             Text("${rows.size} 个", color = Muted, fontSize = 12.sp)
+            if (vm.moveProject != null) IconButton(onClick = { sortingProjects = true }, enabled = s.projects.size > 1) { Icon(Icons.Outlined.SwapVert, "调整项目顺序", Modifier.size(20.dp)) }
+            if (vm.addProject != null) IconButton(onClick = { creatingProject = true }, enabled = s.connected) { Icon(Icons.Outlined.CreateNewFolder, "创建项目", Modifier.size(20.dp)) }
             Box {
                 IconButton(onClick = { filterMenu = true }) { Icon(Icons.Outlined.FilterList, "筛选会话", Modifier.size(20.dp), tint = if (filter == "all" && !s.showArchived) Muted else Mint) }
                 DropdownMenu(filterMenu, { filterMenu = false }) {
@@ -143,6 +148,7 @@ import java.util.Locale
                             Text(project.name, style = MaterialTheme.typography.titleSmall)
                             Text(projectNavigationSummary(s, project), fontSize = 11.sp, color = Muted)
                         }
+                        if (vm.removeProject != null) IconButton(onClick = { projectInfo = project }) { Icon(Icons.Outlined.MoreHoriz, "项目操作", Modifier.size(20.dp)) }
                         Icon(if (expanded) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight, if (s.project?.id == project.id) "收起项目" else "加载项目会话", tint = Muted)
                     }
                 }
@@ -173,7 +179,7 @@ import java.util.Locale
                                         Text(thread.title, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                     val running = tab?.running == true || thread.status in setOf("active", "inProgress")
-                                    Text(listOfNotNull(if (running) "运行中" else threadDate(thread.updated), "草稿".takeIf { tab?.hasDraft == true }, "未读".takeIf { tab?.unread == true }).joinToString(" · "), fontSize = 12.sp, color = if (running) Mint else Muted)
+                                    Text(listOfNotNull(agentLabel(thread.engineId), if (tab != null) taskPresentation(s, tab).label else if (running) "运行中" else threadDate(thread.updated), "草稿".takeIf { tab?.hasDraft == true }, "未读".takeIf { tab?.unread == true }).joinToString(" · "), fontSize = 12.sp, color = if (running) Mint else Muted)
                                 }
                                 if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                                 Box {
@@ -202,7 +208,8 @@ import java.util.Locale
             Column(Modifier.fillMaxWidth().padding(vertical = 44.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Icon(Icons.Outlined.FolderOpen, null, Modifier.size(36.dp), tint = Muted)
                 Text(if (s.connected) "还没有项目" else "连接你的电脑", style = MaterialTheme.typography.titleMedium)
-                Text(if (s.connected) "在电脑上的 Agent 中添加项目或创建会话后刷新。" else "连接后即可查看项目，继续会话。", color = Muted, fontSize = 14.sp)
+                Text(if (s.connected) "点击创建项目，选择电脑上的已有目录。" else "连接后即可查看项目，继续会话。", color = Muted, fontSize = 14.sp)
+                if (s.connected && vm.addProject != null) Button(onClick = { creatingProject = true }) { Text("创建项目") }
                 if (!s.connected) Button(onClick = settings) { Text("设置连接") }
             }
         }
@@ -215,79 +222,39 @@ import java.util.Locale
             s.profile?.id?.let { vm.renameThread(it, thread.id, threadName) }; renaming = null
         }) { Text("保存") } }, dismissButton = { TextButton(onClick = { renaming = null }) { Text("取消") } })
     }
-    projectInfo?.let { p -> AlertDialog(onDismissRequest = { projectInfo = null }, title = { Text(p.name) }, text = { androidx.compose.foundation.text.selection.SelectionContainer { Text(p.roots.joinToString("\n"), fontSize = 14.sp) } }, confirmButton = { TextButton(onClick = { projectInfo = null }) { Text("完成") } }) }
+    if (sortingProjects) {
+        AlertDialog(onDismissRequest = { sortingProjects = false }, title = { Text("调整项目顺序") }, text = {
+            Column {
+                Text("当前电脑的全部项目 · 调整后自动保存", fontSize = 12.sp, color = Muted)
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 400.dp)) {
+                    items(s.projects, key = { it.id }) { project ->
+                        val index = s.projects.indexOfFirst { it.id == project.id }
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(project.name, modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            IconButton(enabled = index > 0, onClick = { s.profile?.id?.let { vm.moveProject?.invoke(it, project.id, -1) } }) {
+                                Icon(Icons.Outlined.ArrowUpward, "上移 ${project.name}")
+                            }
+                            IconButton(enabled = index < s.projects.lastIndex, onClick = { s.profile?.id?.let { vm.moveProject?.invoke(it, project.id, 1) } }) {
+                                Icon(Icons.Outlined.ArrowDownward, "下移 ${project.name}")
+                            }
+                        }
+                    }
+                }
+            }
+        }, confirmButton = { TextButton(onClick = { sortingProjects = false }) { Text("完成") } })
+    }
+    if (creatingProject) s.profile?.let { profile ->
+        ProjectDirectoryDialog(profile.id, profile.connectionLabel(s.profiles), s.root, vm) { creatingProject = false }
+    }
+    projectInfo?.let { p -> AlertDialog(onDismissRequest = { projectInfo = null }, title = { Text(p.name) }, text = { SelectionContainer { Text(p.roots.joinToString("\n"), fontSize = 14.sp) } }, confirmButton = { TextButton(onClick = { projectInfo = null }) { Text("完成") } }, dismissButton = {
+        if (vm.removeProject != null) TextButton(onClick = { projectInfo = null; removingProject = p }) { Text("移除项目") }
+    }) }
+    removingProject?.let { p -> AlertDialog(onDismissRequest = { removingProject = null }, title = { Text("移除 ${p.name}？") }, text = { Text("仅从 Orbit 项目列表解除关联，保留电脑上的目录、会话和已打开的标签。之后可重新选择该目录添加。") }, confirmButton = {
+        TextButton(onClick = { s.profile?.id?.let { vm.removeProject?.invoke(it, p) }; removingProject = null }) { Text("移除") }
+    }, dismissButton = { TextButton(onClick = { removingProject = null }) { Text("取消") } }) }
 }
 
 private fun threadDate(seconds: Long): String {
     if (seconds <= 0) return "随时继续"
     return SimpleDateFormat("MM 月 dd 日 · HH:mm", Locale.CHINA).format(Date(seconds * 1000))
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable internal fun SettingsScreen(s: PocketState, vm: PocketViewModel, edit: (HostProfile) -> Unit) {
-    var deletion by remember { mutableStateOf<HostProfile?>(null) }
-    var menu by remember { mutableStateOf<String?>(null) }
-    var issue by remember { mutableStateOf<HostProfile?>(null) }
-    LazyColumn(contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)) {
-        item {
-            Text("连接", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp, bottom = 10.dp))
-        }
-        items(s.profiles, key = { it.id }) { profile ->
-            val connection = s.connections[profile.id] ?: HostConnectionStatus()
-            val first = s.profiles.firstOrNull()?.id == profile.id
-            val busy = connection.connecting || connection.reconnecting
-            val status = if (!profile.autoConnect) "已关闭" else connection.label
-            Surface(color = Panel, shape = RoundedCornerShape(topStart = if (first) 24.dp else 0.dp, topEnd = if (first) 24.dp else 0.dp),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-                Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).combinedClickable(onClick = { edit(profile) }, onLongClick = { menu = profile.id }).padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Icon(Icons.Outlined.DragHandle, "拖动调整连接顺序", tint = Ink, modifier = Modifier.size(48.dp).pointerInput(profile.id) {
-                        var drag = 0f
-                        detectVerticalDragGestures(onDragStart = { drag = 0f }, onDragEnd = { drag = 0f }, onDragCancel = { drag = 0f }) { change, delta ->
-                            change.consume(); drag += delta
-                            if (kotlin.math.abs(drag) > 64.dp.toPx()) { vm.moveProfile(profile.id, if (drag > 0) 1 else -1); drag = 0f }
-                        }
-                    })
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text(profile.name, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (s.profiles.count { it.name == profile.name } > 1) Text(profile.host, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (busy) Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
-                    }
-                    Box {
-                        if (!busy) Text(status, color = if (connection.error != null) MaterialTheme.colorScheme.error else Muted, fontSize = 12.sp, modifier = Modifier.clickable(enabled = connection.error != null || connection.needsCredentials || connection.needsTrust) { issue = profile }.padding(vertical = 12.dp))
-                        DropdownMenu(expanded = menu == profile.id, onDismissRequest = { menu = null }) {
-                            DropdownMenuItem(text = { Text(profile.name, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }, onClick = {}, enabled = false)
-                            DropdownMenuItem(text = { Text("编辑") }, leadingIcon = { Icon(Icons.Outlined.Edit, null) }, onClick = { menu = null; edit(profile) })
-                            DropdownMenuItem(text = { Text(if (profile.autoConnect) "断开连接" else "连接") }, leadingIcon = { Icon(Icons.Outlined.PowerSettingsNew, null) }, onClick = {
-                                menu = null
-                                if (!vm.setConnectionEnabled(profile, !profile.autoConnect)) edit(profile.copy(autoConnect = true))
-                            })
-                            DropdownMenuItem(text = { Text("删除连接") }, leadingIcon = { Icon(Icons.Outlined.DeleteOutline, null) }, onClick = { menu = null; deletion = profile })
-                        }
-                    }
-                    Switch(profile.autoConnect, { enabled -> if (!vm.setConnectionEnabled(profile, enabled) && enabled) edit(profile.copy(autoConnect = true)) }, modifier = Modifier.semantics { contentDescription = "${profile.name} 连接开关" },
-                        colors = SwitchDefaults.colors(checkedTrackColor = Mint, checkedThumbColor = MaterialTheme.colorScheme.onPrimary, uncheckedBorderColor = MaterialTheme.colorScheme.outlineVariant))
-                }
-            }
-        }
-        item {
-            Surface(onClick = { edit(HostProfile()) }, color = Panel, shape = RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp,
-                topStart = if (s.profiles.isEmpty()) 24.dp else 0.dp, topEnd = if (s.profiles.isEmpty()) 24.dp else 0.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-                Text("添加连接", fontSize = 16.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 20.dp))
-            }
-        }
-        item { ProductSettings(vm, s) }
-        item {
-            Text("开关开启后自动连接并重连。点击编辑，长按管理，拖动左侧调整顺序。", fontSize = 12.sp, lineHeight = 20.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 12.dp, vertical = 16.dp))
-            Text("ORBIT  ·  ${BuildConfig.VERSION_NAME}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 12.dp, top = 8.dp))
-        }
-    }
-    issue?.let { profile ->
-        val message = s.connections[profile.id]?.error.orEmpty()
-        val advice = connectionAdvice(message)
-        AlertDialog(onDismissRequest = { issue = null }, title = { Text("${profile.name} · 连接问题") }, text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(advice.title); Text(advice.action, fontSize = 13.sp, color = Muted)
-            if (message.isNotBlank()) SelectionContainer { Text(message, fontSize = 12.sp, color = Muted) }
-        } }, confirmButton = { TextButton(onClick = { issue = null; edit(profile) }) { Text("编辑连接") } }, dismissButton = { TextButton(onClick = { issue = null; vm.reconnect(profile) }) { Text("重新连接") } })
-    }
-    deletion?.let { profile -> AlertDialog(onDismissRequest = { deletion = null }, title = { Text("删除 ${profile.name}？") }, text = { Text("将移除手机保存的连接和登录信息。") }, confirmButton = { TextButton(onClick = { vm.deleteProfile(profile); deletion = null }) { Text("删除") } }, dismissButton = { TextButton(onClick = { deletion = null }) { Text("取消") } }) }
 }

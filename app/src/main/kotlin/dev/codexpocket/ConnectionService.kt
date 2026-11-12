@@ -6,28 +6,42 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import kotlinx.coroutines.*
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import dev.codexpocket.core.json
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
 internal class TaskNotices(private val app: Application) {
     private val manager = app.getSystemService(NotificationManager::class.java)
-    private val ids = mutableSetOf<Int>()
-    init { manager.createNotificationChannel(NotificationChannel("tasks", "任务与审批", NotificationManager.IMPORTANCE_DEFAULT).apply { description = "任务完成和待处理审批；通知不显示消息正文" }) }
+    private val ledger = Vault(app)
+    private val delivered = runCatching { ledger.get("task-notices:v1")?.let { json.decodeFromString<Set<String>>(it) } }.getOrNull().orEmpty().toMutableSet()
+    init { manager.createNotificationChannel(NotificationChannel("tasks", "任务与审批", NotificationManager.IMPORTANCE_HIGH).apply {
+        description = "任务完成、待确认和待回答事项的横幅提醒；不显示消息正文"
+        enableVibration(true)
+    }) }
     private fun show(key: String, title: String, tab: SessionTab?) {
+        if (key in delivered || !androidx.core.app.NotificationManagerCompat.from(app).areNotificationsEnabled() ||
+            manager.getNotificationChannel("tasks")?.importance == NotificationManager.IMPORTANCE_NONE) return
         if (Build.VERSION.SDK_INT >= 33 && app.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
         val id = key.hashCode()
         val intent = Intent(app, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .setData(android.net.Uri.parse("orbit://task/" + android.net.Uri.encode(key)))
             .putExtra("sessionKey", tab?.key)
         val pending = PendingIntent.getActivity(app, id, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        manager.notify(id, Notification.Builder(app, "tasks").setSmallIcon(dev.codexpocket.R.drawable.ic_pocket).setContentTitle(title)
-            .setContentText(if (tab == null) "打开 Orbit 处理" else "${tab.profileName} · 标签 ${tab.label}")
+        manager.notify(key, id, Notification.Builder(app, "tasks").setSmallIcon(dev.codexpocket.R.drawable.ic_pocket).setContentTitle(title)
+            .setContentText(if (tab == null) "打开 Orbit 处理" else "${tab.profileName} · ${tab.project.name}")
+            .setCategory(Notification.CATEGORY_STATUS).setOnlyAlertOnce(true)
             .setVisibility(Notification.VISIBILITY_PRIVATE).setContentIntent(pending).setAutoCancel(true).build())
-        ids += id
+        delivered += key
+        ledger.put("task-notices:v1", json.encodeToString(delivered.toSet()))
     }
     fun changed(before: PocketState, after: PocketState) {
         taskSignals(before, after).forEach { show(it.key, it.title, it.tab) }
     }
-    fun clear() { ids.forEach(manager::cancel); ids.clear() }
+    fun clear() {
+        manager.activeNotifications.filter { it.notification.channelId == "tasks" }.forEach { manager.cancel(it.tag, it.id) }
+    }
 }
 
 /** Explicit, user-controlled persistent SSH session service. It never starts at boot. */
@@ -41,7 +55,7 @@ class ConnectionService : Service() {
         show("正在维持 SSH 连接")
         scope.launch {
             PocketRuntime.get(application).controller.state.map { s ->
-                "${s.connections.values.count { it.connected }} 台已连接 · ${s.sessionTabs.count { it.running }} 个任务运行中"
+                "${s.connections.values.count { it.connected }} 台已连接 · ${followedTasks(s).count { it.running }} 个任务运行中"
             }.distinctUntilChanged().collect { show(it) }
         }
     }

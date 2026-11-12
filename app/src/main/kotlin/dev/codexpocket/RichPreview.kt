@@ -14,6 +14,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -99,9 +100,13 @@ data class WebPreview(val source: String, val profile: String, val url: String? 
     }
 }
 @Composable internal fun DocumentPane(source: String, format: String, context: ArtifactContext?, root: String?, modifier: Modifier) {
-    if (format in setOf("md", "markdown")) Column(modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
+    if (format in setOf("mermaid", "mmd")) {
+        val dark = Paper.luminance() < 0.5f
+        val html = remember(source, dark) { mermaidDocument(source, dark) }
+        key(html) { BrowserPane(modifier, context = null, html = html, bundledMermaid = true) }
+    } else if (format in setOf("md", "markdown")) Column(modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
         // Prevent recursively expanding linked documents inside a document preview.
-        if (context == null) Markdown(source)
+        if (context == null) ConversationBody(source, emptyList(), root.orEmpty(), "document", remember { ConversationImageLoader { _, _ -> error("暂无图片来源") } }, expandArtifacts = false)
         else CompositionLocalProvider(LocalArtifactContext provides context.copy(cwd = root ?: context.cwd), LocalOpenProjectFile provides { link -> context.vm.openLink(context.profile, link, root ?: context.cwd) }) {
             ConversationBody(source, emptyList(), root ?: "/", "document:${context.profile}", context.vm.imageLoaderFor(context.profile), expandArtifacts = false)
         }
@@ -127,7 +132,7 @@ data class WebPreview(val source: String, val profile: String, val url: String? 
 }
 
 @SuppressLint("SetJavaScriptEnabled")
-@Composable internal fun BrowserPane(modifier: Modifier, context: ArtifactContext?, html: String? = null, root: String? = null, url: String? = null, remote: String? = null, localPort: Int? = null) {
+@Composable internal fun BrowserPane(modifier: Modifier, context: ArtifactContext?, html: String? = null, root: String? = null, url: String? = null, remote: String? = null, localPort: Int? = null, bundledMermaid: Boolean = false) {
     val origin = remember(html, root, context?.profile) { "https://${UUID.randomUUID()}.pocket.invalid" }
     var view by remember { mutableStateOf<WebView?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -142,12 +147,14 @@ data class WebPreview(val source: String, val profile: String, val url: String? 
             settings.allowFileAccess = false; settings.allowContentAccess = false
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             settings.setSupportMultipleWindows(false)
+            if (bundledMermaid) { settings.setSupportZoom(true); settings.builtInZoomControls = true; settings.displayZoomControls = false }
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(v: WebView, target: String?) { back = v.canGoBack() }
                 override fun onReceivedError(v: WebView, request: WebResourceRequest, failure: WebResourceError) { if (request.isForMainFrame) error = failure.description.toString() }
                 override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
                     val address = request.url.toString()
+                    if (bundledMermaid) return true
                     if (address.startsWith(origin + "/")) {
                         if (request.isForMainFrame && root != null && context != null && request.url.path?.substringAfterLast('.')?.lowercase() in setOf("md", "markdown")) {
                             runCatching { artifactResourcePath(root, request.url.encodedPath ?: "/") }.getOrNull()?.let { context.vm.openLink(context.profile, it, root) }
@@ -167,6 +174,11 @@ data class WebPreview(val source: String, val profile: String, val url: String? 
                 }
                 override fun shouldInterceptRequest(v: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val address = request.url.toString()
+                    if (bundledMermaid) {
+                        return if (address == origin + "/__orbit_mermaid__/mermaid.min.js" && request.method == "GET")
+                            WebResourceResponse("application/javascript", "UTF-8", ctx.assets.open("mermaid/mermaid.min.js"))
+                        else denied()
+                    }
                     if (!address.startsWith(origin + "/")) return if (html != null && isLoopbackLink(address)) denied() else null
                     if (context == null || root == null || request.method != "GET") return denied()
                     return try {

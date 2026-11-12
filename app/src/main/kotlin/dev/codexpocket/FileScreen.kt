@@ -80,7 +80,7 @@ internal fun directoryCrumbs(root: String, path: String): List<Pair<String, Stri
 @Composable internal fun FilePreviewScreen(file: FilePreview, s: PocketState, vm: PocketViewModel) {
     val ext = file.path.substringAfterLast('.').lowercase()
     val image = ext in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp")
-    val rich = ext in setOf("html", "htm", "svg", "md", "markdown")
+    val rich = ext in setOf("html", "htm", "svg", "md", "markdown", "mermaid", "mmd")
     val binary = !image && !rich && file.bytes.any { it == 0.toByte() }
     var source by rememberSaveable(file.path) { mutableStateOf(false) }; var wrap by rememberSaveable { mutableStateOf(true) }
     var query by rememberSaveable(file.path) { mutableStateOf("") }; var searching by rememberSaveable { mutableStateOf(false) }
@@ -115,7 +115,7 @@ internal fun directoryCrumbs(root: String, path: String): List<Pair<String, Stri
                 if (bitmap == null) StateNotice("图片无法解码", failure = true) else Image(bitmap.asImageBitmap(), shortPath(file.path), Modifier.fillMaxSize().padding(12.dp))
             }
             binary -> StateNotice("此文件暂不支持预览", "可以复制路径或引用到会话，由电脑端工具读取。")
-            rich && !source -> DocumentPane(text, if (ext in setOf("md", "markdown")) "markdown" else if (ext == "svg") "svg" else "html", artifact, file.path.substringBeforeLast('/'), Modifier.weight(1f).fillMaxWidth())
+            rich && !source -> DocumentPane(text, if (ext in setOf("md", "markdown")) "markdown" else if (ext in setOf("mermaid", "mmd")) "mermaid" else if (ext == "svg") "svg" else "html", artifact, file.path.substringBeforeLast('/'), Modifier.weight(1f).fillMaxWidth())
             else -> FileCodeContent(text, if (searching) query else "", wrap, Modifier.weight(1f))
         }
     }

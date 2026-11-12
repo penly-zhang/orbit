@@ -18,8 +18,18 @@ import java.util.concurrent.TimeUnit
 /** Exercises the production preview composable on a real Android WebView; no remote tasks/files. */
 class PreviewInstrumentation : Instrumentation() {
     private var scenario = ""
-    override fun onCreate(arguments: Bundle?) { scenario = arguments?.getString("scenario").orEmpty(); super.onCreate(arguments); start() }
+    private var diagnosticProfile = ""
+    private var diagnosticThread = ""
+    private var diagnosticCommand = ""
+    override fun onCreate(arguments: Bundle?) { scenario = arguments?.getString("scenario").orEmpty(); diagnosticProfile = arguments?.getString("profile").orEmpty(); diagnosticThread = arguments?.getString("thread").orEmpty(); diagnosticCommand = arguments?.getString("command").orEmpty(); super.onCreate(arguments); start() }
     override fun onStart() {
+        if (scenario == "markdown-stability") { MarkdownStabilityProbe(this).run(); return }
+        if (scenario == "task-notifications") { TaskNotificationProbe(this).run(); return }
+        if (scenario == "agent-remote-command") { AgentDiagnosticsProbe(this).run(diagnosticProfile, "", commandBase64 = diagnosticCommand); return }
+        if (scenario == "agent-diagnostics") { AgentDiagnosticsProbe(this).run(diagnosticProfile, diagnosticThread); return }
+        if (scenario == "agent-shared-enable") { AgentDiagnosticsProbe(this).run(diagnosticProfile, diagnosticThread, enableShared = true); return }
+        if (scenario == "connections") { ProductUiProbe(this).run(connectionsOnly = true); return }
+        if (scenario == "mermaid") { MermaidUiProbe(this).run(); return }
         if (scenario == "conversation") { ConversationUiProbe(this).run(); return }
         if (scenario == "session-gestures") { ProductUiProbe(this).run(gesturesOnly = true); return }
         if (scenario == "navigation-tools") { ProductUiProbe(this).run(toolsOnly = true); return }

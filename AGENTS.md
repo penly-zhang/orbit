@@ -1,6 +1,6 @@
 # Orbit
 
-Orbit is a mobile-first Android workspace for agent engines. The phone is the primary work surface; computers host the execution environment. The current implementation integrates Codex app-server over SSH. Keep the product name engine-neutral and describe additional engines as planned until implemented.
+Orbit is a mobile-first Android workspace for agent engines. The phone is the primary work surface; computers host the execution environment. The current implementation auto-discovers Codex and the protocol-compatible traex over SSH. Agent choice belongs to each conversation and is fixed after creation; projects aggregate both agents. Keep the product name engine-neutral and describe additional engines as planned until implemented.
 
 ## Workspace
 
@@ -22,6 +22,8 @@ sh tools/gradle.sh :core:test :app:testDebugUnitTest :app:assembleDebug :app:lin
 ```
 
 Debug APK: `app/build/outputs/apk/debug/app-debug.apk`. Run `python3 tools/package_artifact.py` to package Orbit-named downloads. Verification should be proportional to the change. Integration tests use local SSH/RPC fixtures; live model probes are separate opt-in tasks.
+
+After app changes pass the appropriate checks, automatically install the debug APK on the user's configured Android device, preserving app data. The user has authorized this workflow; do not wait for a separate installation request. Verify installation and startup, and report if device access prevents completion. Keep device connection details in local configuration rather than tracked files.
 
 ## Agent boundaries
 

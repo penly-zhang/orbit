@@ -71,8 +71,8 @@ fun messageContent(text: String): List<MessageContent> {
                 val current = fence
                 if (current == null) {
                     val language = line.trim().removePrefix(run).trim().lowercase()
-                    if (language in setOf("html", "svg", "markdown", "md")) {
-                        val closing = Regex("(?m)^ {0,3}" + Regex.escape(run) + "[ \t]*$").find(text, (lineEnd + 1).coerceAtMost(text.length))
+                    if (language in setOf("html", "svg", "markdown", "md", "mermaid")) {
+                        val closing = Regex("(?m)^ {0,3}" + Regex.escape(run.first().toString()) + "{" + run.length + ",}[ \t]*\\r?$").find(text, (lineEnd + 1).coerceAtMost(text.length))
                         if (closing != null) {
                             if (i > start) parts += MessageContent.Text(text.substring(start, i))
                             parts += MessageContent.Document(text.substring((lineEnd + 1).coerceAtMost(text.length), closing.range.first), language)
@@ -146,7 +146,7 @@ fun messageContent(text: String): List<MessageContent> {
             else raw.replace(Regex("\\s+[\"'][^\\n]*[\"']$"), "").trim().replace(Regex("\\\\([()\\\\ ])"), "$1")
         if (source.isBlank()) { i++; continue }
         val label = text.substring(labelStart, labelEnd).ifBlank { "回复中的图片" }
-        val artifact = !imageSyntax && isRemoteFileLink(source) && Regex("(?i)\\.(html?|md|markdown|svg)(?:[?#].*)?$").containsMatchIn(source)
+        val artifact = !imageSyntax && isRemoteFileLink(source) && Regex("(?i)\\.(html?|md|markdown|svg|mermaid|mmd)(?:[?#].*)?$").containsMatchIn(source)
         if (!imageSyntax && !artifact && !Regex("(?i)\\.(png|jpe?g|webp|gif|bmp)(?:[?#].*)?$").containsMatchIn(source)) { i++; continue }
         if (i > start) parts += MessageContent.Text(text.substring(start, i))
         if (artifact) parts += MessageContent.Artifact(source, label) else parts += MessageContent.Image(ChatImage(source, label))

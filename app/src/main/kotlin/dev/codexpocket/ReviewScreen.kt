@@ -61,7 +61,7 @@ import java.util.Locale
                 
                 Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(!task, { vm.chooseReviewRange("workspace") }, label = { Text("工作区") })
-                    FilterChip(task, { vm.chooseReviewRange("task") }, enabled = s.taskReview != null || task, label = { Text("本轮期间") })
+                    FilterChip(task, { vm.chooseReviewRange("task") }, enabled = s.taskReview != null || s.activeTurn != null || task, label = { Text("本轮期间") })
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(if (verified) "${changes.size} 个文件" else if (loading) "正在读取…" else "尚未读取", fontSize = 13.sp)
@@ -71,6 +71,7 @@ import java.util.Locale
                 }
                 if (verified && changes.isNotEmpty()) Text("已看过 $viewed / ${changes.size} 个文件", fontSize = 12.sp, color = Muted, modifier = Modifier.padding(top = 4.dp))
                 if (task && s.taskReview?.partial == true) Text("大文件或超出范围的文件未完整统计，行数未知显示为 —。", fontSize = 12.sp, color = Muted)
+                if (s.activeTurn != null) Text("运行中不自动刷新，点击刷新查看最新变更。", fontSize = 12.sp, color = Muted)
             }
             if (searching) item(key = "search") {
                 OutlinedTextField(search, { search = it }, placeholder = { Text("搜索文件路径") }, singleLine = true, modifier = Modifier.fillMaxWidth(), trailingIcon = { IconButton(onClick = { search = ""; searching = false }) { Icon(Icons.Outlined.Close, "关闭文件搜索") } })

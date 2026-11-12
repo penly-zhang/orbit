@@ -19,7 +19,7 @@ internal data class ThreadActionTarget(val profileId: String, val project: Proje
     val context = LocalContext.current
     val export = LocalExportConversation.current
     val snapshot = vm.conversationState(target.profileId, target.thread.id)
-    val tab = s.sessionTabs.find { it.profileId == target.profileId && it.thread.id == target.thread.id }
+    val tab = allTaskSessions(s).find { it.profileId == target.profileId && it.thread.id == target.thread.id }
     val thread = snapshot?.thread ?: tab?.thread ?: target.thread
     val connected = s.connections[target.profileId]?.connected == true
     val profile = s.profiles.find { it.id == target.profileId }
@@ -58,9 +58,10 @@ internal data class ThreadActionTarget(val profileId: String, val project: Proje
                 item { ActionRow(if (pinned) "取消置顶" else "置顶会话", Icons.Outlined.PushPin) {
                     vm.pinThread(target.profileId, target.project.id, thread.id, !pinned); dismiss()
                 } }
+                if (tab != null) item { ActionRow(if (tab.tracked) "取消关注任务" else "关注任务", Icons.Outlined.PendingActions, supporting = "关注后关闭标签仍会跟踪") { vm.trackTask(tab, !tab.tracked); dismiss() } }
                 item { ActionRow("重命名会话", Icons.Outlined.Edit, connected, "同步到电脑") { name = thread.title; operation = "rename" } }
-                if (tab != null) item { ActionRow("标签名称", Icons.Outlined.Label, supporting = "仅修改手机上的标签") { name = tab.name; operation = "label" } }
-                if (tab != null) item { ActionRow("关闭会话标签", Icons.Outlined.Close, supporting = "电脑上的会话与任务保留") {
+                if (tab != null && tab.tabOpen) item { ActionRow("标签名称", Icons.Outlined.Label, supporting = "仅修改手机上的标签") { name = tab.name; operation = "label" } }
+                if (tab != null && tab.tabOpen) item { ActionRow("关闭会话标签", Icons.Outlined.Close, supporting = "电脑上的会话与任务保留") {
                     if (tab.hasDraft) closing = tab else { vm.closeConversation(tab.key); dismiss() }
                 } }
                 item { ActionRow(if (target.archived) "恢复会话" else "归档会话", if (target.archived) Icons.Outlined.Unarchive else Icons.Outlined.Archive,
@@ -70,10 +71,10 @@ internal data class ThreadActionTarget(val profileId: String, val project: Proje
                 } }
                 item { HorizontalDivider(Modifier.padding(horizontal = 18.dp)) }
                 item { ActionRow("会话详情", Icons.Outlined.Info) { page = "details"; if (snapshot != null) vm.refreshUsage(target.profileId, thread.id) } }
-                item { ActionRow("分享会话", Icons.Outlined.Share, loaded, if (loaded) "仅包含已加载的消息" else "打开会话以加载消息") {
+                item { ActionRow("分享会话", Icons.Outlined.Share, loaded, if (loaded && snapshot?.historyCursor == null && snapshot?.cached == false) "本会话全部已同步消息" else if (loaded) "仅包含已加载的消息；可在消息搜索中加载完整历史" else "打开会话以加载消息") {
                     shareText(context, thread.title, conversationMarkdown(thread.title, snapshot!!.items)); dismiss()
                 } }
-                item { ActionRow("导出 Markdown", Icons.Outlined.FileDownload, loaded, "仅包含已加载的消息") {
+                item { ActionRow("导出 Markdown", Icons.Outlined.FileDownload, loaded, if (snapshot?.historyCursor == null && snapshot?.cached == false) "本会话全部已同步消息" else "仅包含已加载的消息；可在消息搜索中加载完整历史") {
                     export(conversationMarkdown(thread.title, snapshot!!.items)); dismiss()
                 } }
                 item { HorizontalDivider(Modifier.padding(horizontal = 18.dp)) }

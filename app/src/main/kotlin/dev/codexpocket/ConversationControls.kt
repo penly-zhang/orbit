@@ -34,7 +34,7 @@ internal data class ComposerActions(
     val icon = when { full -> Icons.Outlined.WarningAmber; current?.reviewer == "auto_review" -> Icons.Outlined.VerifiedUser; current?.permissionId == ":read-only" || current?.sandbox?.text("type") == "readOnly" -> Icons.Outlined.Lock; else -> Icons.Outlined.BackHand }
     Box {
         IconButton(onClick = { menu = true }, enabled = enabled, modifier = Modifier.size(48.dp)) {
-            Icon(icon, "选择权限：${current?.permissionLabel ?: "读取中"}", Modifier.size(25.dp), tint = if (full) Color(0xffb57d20) else Ink)
+            Icon(icon, "选择权限：${current?.permissionLabel ?: if (s.thread == null) "创建会话后可调整" else "读取中"}", Modifier.size(25.dp), tint = if (full) Color(0xffb57d20) else Ink)
         }
         DropdownMenu(menu, { menu = false }, modifier = Modifier.widthIn(min = 280.dp, max = 320.dp).heightIn(max = 520.dp), shape = RoundedCornerShape(22.dp), containerColor = Panel) {
             s.permissions.sortedBy { when { it.id == ":workspace" && it.reviewer == "user" -> 0; it.id == ":workspace" -> 1; it.id == ":read-only" -> 2; it.id == ":danger-full-access" -> 3; else -> 4 } }.forEach { option ->
@@ -60,7 +60,7 @@ internal data class ComposerActions(
     val model = s.models.find { it.id == current?.model }
     val effort = current?.effort ?: model?.defaultEffort
     val enabled = settingsEnabled(s)
-    val name = model?.name ?: current?.model?.takeIf { it.isNotBlank() } ?: "读取模型…"
+    val name = model?.name ?: current?.model?.takeIf { it.isNotBlank() } ?: if (s.thread == null) "默认模型" else "读取模型…"
     Box(modifier, contentAlignment = Alignment.CenterEnd) {
         TextButton(onClick = { page = "effort"; menu = true }, enabled = enabled, modifier = Modifier.heightIn(min = 40.dp)) {
             Text(if (LocalDensity.current.fontScale >= 1.5f) "模型" else "${compactModelName(name)} ${effortName(effort)}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)

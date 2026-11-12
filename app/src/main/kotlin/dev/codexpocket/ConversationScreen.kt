@@ -19,12 +19,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.Velocity
 import dev.codexpocket.core.*
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 
@@ -39,14 +43,32 @@ import kotlinx.coroutines.launch
     val picker = LocalImagePicker.current
     val selectedTab = s.sessionTabs.find { it.profileId == s.profile?.id && it.thread.id == s.thread?.id }
     var following by rememberSaveable(s.profile?.id, s.thread?.id) { mutableStateOf(true) }
-    LaunchedEffect(listState, s.thread?.id) {
-        snapshotFlow { listState.isScrollInProgress to (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0) }
-            .distinctUntilChanged().collect { (scrolling, last) -> if (scrolling) following = last >= listState.layoutInfo.totalItemsCount - 2 }
+    val manualScroll = remember(listState, s.profile?.id, s.thread?.id) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && available.y != 0f) following = false
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && (consumed.y != 0f || available.y != 0f)) {
+                    following = !listState.canScrollForward
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                following = !listState.canScrollForward
+                return Velocity.Zero
+            }
+        }
     }
-    LaunchedEffect(s.items.lastOrNull()?.text, s.items.size, entries.size) {
+    LaunchedEffect(s.profile?.id, s.thread?.id, s.activeTurn, s.items.lastOrNull()?.text, s.items.size, entries.size) {
         if (following && !listState.isScrollInProgress) {
             withFrameNanos { }
-            if (listState.layoutInfo.totalItemsCount > 0) listState.scrollToItem(listState.layoutInfo.totalItemsCount - 1)
+            if (following && !listState.isScrollInProgress && listState.layoutInfo.totalItemsCount > 0) {
+                listState.scrollToItem(listState.layoutInfo.totalItemsCount - 1)
+            }
         }
     }
     CompositionLocalProvider(LocalOpenProjectFile provides { link -> s.profile?.id?.let { vm.openLink(it, link, s.root) } }, LocalArtifactContext provides s.profile?.id?.let { ArtifactContext(it, s.root, vm) }) {
@@ -66,6 +88,10 @@ import kotlinx.coroutines.launch
             IconButton(onClick = closeSearch) { Icon(Icons.Outlined.Close, "关闭消息搜索") }
         }
 
+        if (searching) Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(if (s.historyCursor != null || s.cached) "当前搜索已加载内容" else "已覆盖本会话全部已同步消息", color = Muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+            if (s.historyCursor != null) TextButton(onClick = vm::loadAllHistory, enabled = s.connected && s.threadReady && !s.loading) { Text(if (s.loading) "正在加载…" else "加载完整历史") }
+        }
         if (!s.connected) {
             val computer = s.profile?.connectionLabel(s.profiles).orEmpty().ifBlank { "电脑" }
             val status = if (s.connecting || s.reconnecting) "正在重新连接" else "连接已断开"
@@ -76,10 +102,13 @@ import kotlinx.coroutines.launch
         }
         else if (s.attaching || s.cached) Text(if (s.attaching) "正在接续会话…" else "正在更新最近消息…", fontSize = 12.sp, color = Muted,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+        else if (selectedTab != null && selectedTab.progress.status == "failed" && !selectedTab.progress.dismissed && s.activeTurn == null) Box(Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+            StateNotice("本轮执行失败", selectedTab.progress.error ?: "请查看会话中的执行记录。", dismiss = { vm.dismissTaskReminder(selectedTab) }, failure = true)
+        }
         // Lazy items (including selectable text and previews) must stay inside the message viewport.
         // Column lays out siblings but does not clip drawing over the tabs, status or composer.
         Box(Modifier.weight(1f).fillMaxWidth().clipToBounds().sessionSwipe(s.thread?.id, vm::switchSession)) {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().nestedScroll(manualScroll), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                 if (s.historyCursor != null) item(key = "history") { TextButton(onClick = { following = false; vm.moreHistory() }, enabled = !s.loading, modifier = Modifier.fillMaxWidth()) { Text("加载更早消息") } }
                 if (entries.isEmpty() && !s.loading && !s.attaching) item(key = "empty") {
                     Column(Modifier.fillMaxWidth().padding(top = 90.dp, bottom = 40.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -98,6 +127,8 @@ import kotlinx.coroutines.launch
                         Text("正在工作…", fontSize = 13.sp, color = Muted)
                     }
                 }
+                // A work group can be taller than the viewport. Target its end, not its header.
+                item(key = "conversation-end") { Spacer(Modifier.height(1.dp)) }
             }
             if (!following && entries.isNotEmpty()) FilledTonalIconButton(onClick = {
                 following = true
@@ -129,10 +160,22 @@ import kotlinx.coroutines.launch
         val context = LocalContext.current
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             ConversationBody(item.text, item.images, cwd, session, loader)
-            if (item.text.isNotBlank() && item.phase != "commentary") IconButton(onClick = {
-                (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Orbit", item.text))
-                Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
-            }, modifier = Modifier.size(32.dp)) { Icon(Icons.Outlined.ContentCopy, "复制回复", Modifier.size(18.dp), tint = Muted) }
+            if (item.text.isNotBlank() && item.phase != "commentary") Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                IconButton(onClick = {
+                    (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Orbit", item.text))
+                    Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                }, modifier = Modifier.size(32.dp)) { Icon(Icons.Outlined.ContentCopy, "复制回复", Modifier.size(18.dp), tint = Muted) }
+                item.turnCompletedAtMs?.let { completedAt ->
+                    val time = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date(completedAt))
+                    val duration = item.turnDurationMs ?: item.turnStartedAtMs?.let { (completedAt - it).coerceAtLeast(0) }
+                    Text(listOfNotNull(time, duration?.let { "耗时 ${workDuration(it)}" }).joinToString(" · "),
+                        color = Muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                }
+            }
         }
     }
 }

@@ -199,6 +199,10 @@ try:
             if "appServer" in params.get("sourceKinds", []):
                 for thread in threads.values():
                     if thread["materialized"] and thread.get("archived", False) == params.get("archived", False):
+                        if "projectId" in params and thread.get("projectId") != params["projectId"]:
+                            continue
+                        if "cwd" in params and thread["cwd"] not in params["cwd"]:
+                            continue
                         data.append({k: v for k, v in thread.items() if k not in ["materialized"]})
             result = {"data": data, "nextCursor": None}
         elif method == "thread/read":
@@ -218,6 +222,9 @@ try:
             result = {"thread": {"id": tid, "path": path}}
         elif method in ["thread/turns/list", "thread/items/list", "thread/resume"]:
             thread_id = params["threadId"]
+            if method == "thread/resume" and thread_id == "fixture-writer-conflict":
+                send({"id": message["id"], "error": {"code": -32000, "message": "Failed to initialize session: thread-store conflict: thread fixture-writer-conflict already has an active writer: process TRAE CLI"}})
+                continue
             if thread_id in ["fixture-missing-rollout", "fixture-missing-empty"]:
                 send({"id": message["id"], "error": {"code": -32600, "message": "no rollout found for thread id " + thread_id}})
                 continue

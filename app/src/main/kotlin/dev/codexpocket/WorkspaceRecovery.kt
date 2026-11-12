@@ -18,6 +18,8 @@ import java.util.UUID
     val queuedMessages: List<QueuedMessage> = emptyList(),
     val taskReview: TaskReviewReport? = null,
     val context: List<ContextInput> = emptyList(),
+    val progress: TaskProgress = TaskProgress(),
+    val tabOpen: Boolean = true, val tracked: Boolean = progress.turnId.isNotBlank(),
 )
 @Serializable internal data class SavedHost(val id: String, val tabs: List<SavedTab> = emptyList(), val selectedThread: String? = null, val usage: Map<String, TokenUsage> = emptyMap(), val usageUpdatedAt: Map<String, Long> = emptyMap())
 @Serializable internal data class SavedWorkspace(val hosts: List<SavedHost> = emptyList())

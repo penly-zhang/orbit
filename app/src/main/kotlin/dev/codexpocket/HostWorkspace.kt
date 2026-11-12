@@ -18,11 +18,12 @@ internal class HostWorkspace(
     private val engines: AgentEngineRegistry = AgentEngines.default,
     private val allocateTabNumber: () -> Int,
 ) {
+    private val orbitProjects = OrbitProjects(vault, profile.id)
     private val mutable = MutableStateFlow(run {
         val projects = runCatching { vault.get("projects:${profile.id}")?.let { json.decodeFromString<List<ProjectInfo>>(it) } }.getOrNull().orEmpty()
         val last = runCatching { vault.get("lastProject:${profile.id}") }.getOrNull()
-        val project = projects.find { it.id == last }
-        PocketState(profiles = profiles, profile = profile, projects = projects, project = project,
+        val project = orbitProjects.apply(projects).find { it.id == last }
+        PocketState(profiles = profiles, profile = profile, projects = orbitProjects.apply(projects), project = project,
             root = project?.roots?.firstOrNull().orEmpty(), directory = project?.roots?.firstOrNull().orEmpty())
     })
     val state = mutable.asStateFlow()
@@ -41,7 +42,6 @@ internal class HostWorkspace(
     private var changesJob: Job? = null
     private val reviewBaselines = mutableMapOf<String, ReviewBaseline>()
     private val reviewFinishing = mutableSetOf<String>()
-    private val reviewPolls = mutableMapOf<String, Job>()
     private val reviewSendingRoots = mutableSetOf<String>()
     private val usageReads = mutableMapOf<String, Job>()
     private val usageRevisions = mutableMapOf<String, Long>()
@@ -71,7 +71,7 @@ internal class HostWorkspace(
         val s = state.value
         return SavedHost(s.profile!!.id, s.sessionTabs.map { tab ->
             val source = if (s.thread?.id == tab.thread.id) s else sessions[tab.thread.id]
-            SavedTab(tab.thread, tab.project, tab.number, tab.name, source?.draft.orEmpty(), source?.draftImages.orEmpty(), (source?.sending == true && source.queuedMessages.none { it.sending }) || source?.imageError?.startsWith("发送结果未确认") == true, source?.queuedMessages.orEmpty(), source?.taskReview?.copy(diffs = emptyMap()), source?.draftContext.orEmpty())
+            SavedTab(tab.thread, tab.project, tab.number, tab.name, source?.draft.orEmpty(), source?.draftImages.orEmpty(), (source?.sending == true && source.queuedMessages.none { it.sending }) || source?.imageError?.startsWith("发送结果未确认") == true, source?.queuedMessages.orEmpty(), source?.taskReview?.copy(diffs = emptyMap()), source?.draftContext.orEmpty(), tab.progress, tab.tabOpen, tab.tracked)
         }, s.thread?.id, s.usage, s.usageUpdatedAt)
     }
     fun restore(saved: SavedHost) {
@@ -97,8 +97,8 @@ internal class HostWorkspace(
             val cached = withContext(Dispatchers.IO) { runCatching { vault.get("history:${base.profile!!.id}:${tab.thread.id}")?.let { json.decodeFromString<List<ChatItem>>(it) } }.getOrNull().orEmpty() }
             if (state.value.sessionTabs.any { it.thread.id == tab.thread.id }) updateSession(tab.thread.id) { if (it.items.isEmpty()) it.copy(items = cached) else it }
         } }
-        val selected = sessions[saved.selectedThread]
-        mutable.value = (selected ?: base).copy(sessionTabs = tabs.map { SessionTab(it.thread, it.project, it.number, it.name, profileId = base.profile!!.id, profileName = base.profile.name) })
+        val selected = sessions[saved.selectedThread.takeIf { id -> tabs.any { it.thread.id == id && it.tabOpen } }]
+        mutable.value = (selected ?: base).copy(sessionTabs = tabs.map { SessionTab(it.thread, it.project, it.number, it.name, profileId = base.profile!!.id, profileName = base.profile.name, progress = it.progress, tabOpen = it.tabOpen, tracked = it.tracked) })
     }
     fun resumeConnection() {
         val s = state.value
@@ -107,9 +107,10 @@ internal class HostWorkspace(
     private var uiVisible = false
     fun setVisible(visible: Boolean) {
         uiVisible = visible
-        if (visible) mutable.update { s -> s.copy(sessionTabs = s.sessionTabs.map { if (it.thread.id == s.thread?.id) it.copy(unread = false) else it }) }
+        if (visible) mutable.update { s -> s.copy(sessionTabs = s.sessionTabs.map { if (it.thread.id == s.thread?.id && s.tab == 0) it.copy(unread = false, progress = it.progress.viewed()) else it }) }
     }
     fun updateProfiles(profiles: List<HostProfile>) { mutable.update { it.copy(profiles = profiles, profile = profiles.find { p -> p.id == it.profile?.id } ?: it.profile) } }
+    fun credentialsForEditing(): Credentials = ephemeralCredentials.takeUnless { it == Credentials() } ?: storedCredentials(state.value.profile?.id.orEmpty())
     fun credentialsMissing() { mutable.update { it.copy(needsCredentials = true, connecting = false, reconnecting = false) } }
     fun storedCredentials(id: String) = runCatching { vault.credentials(id) }.getOrDefault(Credentials())
     fun reconnect(profile: HostProfile): Boolean {
@@ -120,19 +121,27 @@ internal class HostWorkspace(
         connect(profile, credentials, preserveWorkspace = state.value.sessionTabs.isNotEmpty() || state.value.project != null)
         return true
     }
-    fun saveAndConnect(profile: HostProfile, credentials: Credentials, remember: Boolean) {
+    fun saveAndConnect(profile: HostProfile, credentials: Credentials, remember: Boolean, connectNow: Boolean = profile.autoConnect) {
         if (profile.host.isBlank() || profile.username.isBlank() || profile.port !in 1..65535) { error("请填写 SSH 地址、用户名和正确端口"); return }
         if (profile.proxyEnabled && (profile.proxyHost.isBlank() || profile.proxyPort !in 1..65535)) { error("请填写正确的 SOCKS5 代理地址和端口"); return }
         val previous = state.value.profiles.find { it.id == profile.id }
+        val previousCredentials = ephemeralCredentials
         val safeProfile = profile.copy(fingerprint = if (previous != null && (previous.host != profile.host || previous.port != profile.port)) "" else profile.fingerprint,
             jumpHosts = profile.jumpHosts.map { hop -> val old = previous?.jumpHosts?.find { it.id == hop.id }; if (old != null && (old.host != hop.host || old.port != hop.port)) hop.copy(fingerprint = "") else hop })
         saveProfile(safeProfile)
         runCatching { if (remember) vault.saveCredentials(safeProfile.id, credentials) else vault.remove("secret:${safeProfile.id}") }.onFailure { error(it.message.orEmpty()) }
         ephemeralCredentials = credentials
-        val sameRoute = previous != null && previous.host == safeProfile.host && previous.port == safeProfile.port && previous.username == safeProfile.username && previous.routeMode == safeProfile.routeMode && previous.remoteTarget == safeProfile.remoteTarget && previous.jumpHosts == safeProfile.jumpHosts && previous.engineId == safeProfile.engineId && previous.codexPath == safeProfile.codexPath
-        if (safeProfile.autoConnect) connect(safeProfile, credentials, preserveWorkspace = sameRoute && (state.value.sessionTabs.isNotEmpty() || state.value.project != null))
-        else { disconnect(preserveWorkspace = sameRoute); ephemeralCredentials = credentials }
+        val sameRoute = previous != null && previous.copy(name = safeProfile.name, autoConnect = safeProfile.autoConnect) == safeProfile
+        // Metadata and storage preferences must not interrupt an existing session.
+        if (sameRoute && previousCredentials == credentials && state.value.connected) return
+        if (connectNow) {
+            val missing = (if (profile.authType == "key") credentials.privateKey.isBlank() else credentials.password.isBlank()) ||
+                profile.jumpHosts.any { hop -> if (hop.authType == "key") credentials.jumps[hop.id]?.privateKey.isNullOrBlank() else credentials.jumps[hop.id]?.password.isNullOrBlank() }
+            if (missing) { disconnect(preserveWorkspace = sameRoute); credentialsMissing(); return }
+            connect(safeProfile, credentials, preserveWorkspace = sameRoute && (state.value.sessionTabs.isNotEmpty() || state.value.project != null))
+        } else if (!sameRoute || previousCredentials != credentials) { disconnect(preserveWorkspace = sameRoute); ephemeralCredentials = credentials }
     }
+
     fun connect(profile: HostProfile, credentials: Credentials, preserveWorkspace: Boolean = false) {
         if (preserveWorkspace) stashSession() else reconnectAttempt = 0
         val workspace = state.value.takeIf { preserveWorkspace }
@@ -143,7 +152,7 @@ internal class HostWorkspace(
         mutable.update { current -> workspace?.copy(profiles = current.profiles, profile = profile, connected = false, connecting = true, reconnecting = true, reconnectAttempt = reconnectAttempt,
             threadReady = false, usageLoading = emptySet(), attaching = workspace.thread != null, taskReviewLoading = false, taskReviewError = if (workspace.taskReviewLoading) "连接已中断，本轮统计未完成" else workspace.taskReviewError, queuedMessages = pausedQueuedMessages(workspace.queuedMessages), queuePaused = workspace.queuedMessages.isNotEmpty(), settingsApplying = false, sending = false, sendingComments = false, pending = emptyList(), error = null, needsCredentials = false)
             ?: PocketState(profiles = current.profiles, profile = profile, connecting = true) }
-        runCatching { vault.get("projects:${profile.id}")?.let { json.decodeFromString<List<ProjectInfo>>(it) } }.getOrNull()?.let { cached -> mutable.update { it.copy(projects = cached, cached = true) } }
+        runCatching { vault.get("projects:${profile.id}")?.let { json.decodeFromString<List<ProjectInfo>>(it) } }.getOrNull()?.let { cached -> mutable.update { it.copy(projects = orbitProjects.apply(cached), cached = true) } }
         connectJob = viewModelScope.launch {
             try {
                 val client = engines.open(profile, credentials, viewModelScope)
@@ -151,7 +160,7 @@ internal class HostWorkspace(
                 connectionJobs += launch(start = CoroutineStart.UNDISPATCHED) { client.events.collect { event(it) } }
                 client.initialize()
                 vault.put("lastProfile", profile.id)
-                mutable.update { it.copy(connected = true, connecting = false, reconnecting = false, reconnectAttempt = 0, trust = null, connectionIssue = null) }
+                mutable.update { it.copy(engineIssues = client.engineIssues, availableEngines = client.availableEngines, connected = true, connecting = false, reconnecting = false, reconnectAttempt = 0, trust = null, connectionIssue = null) }
                 reconnectAttempt = 0
                 // Start the visible project's list before restoring background conversations.
                 val current = state.value
@@ -233,6 +242,7 @@ internal class HostWorkspace(
                         activeTurn = if (unchanged) page.turnId else current.activeTurn,
                         activeTurnStartedAtMs = if (unchanged) page.items.firstOrNull { it.turnId == page.turnId }?.turnStartedAtMs else current.activeTurnStartedAtMs)
                 }
+                if ((turnRevisions[tab.thread.id] ?: 0L) == revision) recordHistorySync(tab.thread.id, page)
             } catch (c: CancellationException) { throw c }
             catch (e: Exception) { if (repo === repository) sessionSyncFailed(tab.thread.id, e) }
         }
@@ -246,12 +256,12 @@ internal class HostWorkspace(
             else current.copy(jumpHosts = current.jumpHosts.map { if (it.id == identity.hopId) it.copy(fingerprint = identity.fingerprint) else it })
         saveProfile(profile); connect(profile, ephemeralCredentials, preserveWorkspace = state.value.sessionTabs.isNotEmpty() || state.value.project != null)
     }
-    fun dismissTrust() { mutable.update { it.copy(trust = null, error = "主机指纹尚未确认，请编辑连接后重试") } }
+    fun dismissTrust() { mutable.update { it.copy(trust = null, connectionIssue = "主机指纹尚未确认，请重新连接并核对指纹", error = null) } }
     fun disconnect(preserveWorkspace: Boolean = false) {
         if (preserveWorkspace) stashSession()
         reconnectJob?.cancel(); reconnectJob = null
         choicesJob?.cancel()
-        reviewPolls.values.forEach(Job::cancel); reviewPolls.clear(); reviewBaselines.clear(); reviewFinishing.clear()
+        reviewBaselines.clear(); reviewFinishing.clear()
         changesJob?.cancel(); changesGeneration++
         threadListJob?.cancel(); threadListJob = null; threadListQuery = null
         usageReads.values.forEach(Job::cancel); usageReads.clear(); usageRevisions.clear()
@@ -262,7 +272,7 @@ internal class HostWorkspace(
         repo?.close(); repo = null
         if (!preserveWorkspace) ephemeralCredentials = Credentials()
         threadGeneration++; fileGeneration++; threadListGeneration++
-        mutable.update { if (!preserveWorkspace) PocketState(profiles = it.profiles, profile = it.profile) else it.copy(connected = false, connecting = false, reconnecting = false, threadsLoading = false, filesLoading = false, changesLoading = false, taskReviewLoading = false, queuedMessages = pausedQueuedMessages(it.queuedMessages), queuePaused = it.queuedMessages.isNotEmpty(), usageLoading = emptySet(), reconnectAttempt = 0, trust = null, pending = emptyList(), imageError = if (it.sending) "发送结果未确认，请检查历史后再决定是否重试" else it.imageError, sending = false, attaching = false, threadReady = false, settingsApplying = false, choicesLoading = false, sendingComments = false) }
+        mutable.update { if (!preserveWorkspace) PocketState(profiles = it.profiles, profile = it.profile) else it.copy(connected = false, connecting = false, reconnecting = false, connectionIssue = null, error = null, needsCredentials = false, threadsLoading = false, filesLoading = false, changesLoading = false, taskReviewLoading = false, queuedMessages = pausedQueuedMessages(it.queuedMessages), queuePaused = it.queuedMessages.isNotEmpty(), usageLoading = emptySet(), reconnectAttempt = 0, trust = null, pending = emptyList(), imageError = if (it.sending) "发送结果未确认，请检查历史后再决定是否重试" else it.imageError, sending = false, attaching = false, threadReady = false, settingsApplying = false, choicesLoading = false, sendingComments = false) }
     }
     fun home() { stashSession(); threadGeneration++; threadListGeneration++; threadListJob?.cancel(); mutable.update { it.copy(project = null, thread = null, preview = null, diff = null, tab = 0, threadCursor = null, threadsLoading = false) } }
     fun clearError() { mutable.update { it.copy(error = null) } }
@@ -274,16 +284,56 @@ internal class HostWorkspace(
     }
     fun refreshProjects() = work {
         val repository = requireRepo()
-        val discovered = repository.projects()
+        val cached = state.value.projects + state.value.sessionTabs.map { it.project }
+        val discovered = repository.projects(cached.distinctBy { it.id })
         if (repo !== repository) return@work
         // Directory groups are user workspaces too. A newer native project or a
         // recent-history window must not erase their cached navigation entries.
-        val projects = retainDirectoryProjects(discovered, state.value.projects)
+        val projects = orbitProjects.apply(retainDirectoryProjects(discovered, state.value.projects))
         val id = state.value.profile?.id ?: return@work
-        withContext(Dispatchers.IO) { vault.put("projects:$id", json.encodeToString(projects)) }
-        mutable.update { it.copy(projects = projects, cached = false) }
+        vault.put("projects:$id", json.encodeToString(projects))
+        if (repo !== repository) return@work
+        sessions.entries.forEach { entry -> entry.setValue(entry.value.copy(project = entry.value.project?.let { canonicalProject(it, projects) })) }
+        val previous = state.value.project
+        val selected = previous?.let { canonicalProject(it, projects) }
+        val changed = selected != previous
+        if (changed) { threadListGeneration++; threadListJob?.cancel() }
+        mutable.update { s -> s.copy(projects = projects, project = selected, cached = false,
+            sessionTabs = s.sessionTabs.map { it.copy(project = canonicalProject(it.project, projects)) },
+            root = if (changed && s.thread == null) selected?.roots?.firstOrNull().orEmpty() else s.root,
+            directory = if (changed && s.thread == null) selected?.roots?.firstOrNull().orEmpty() else s.directory,
+            threadCursor = if (changed) null else s.threadCursor) }
+        if (selected != null) vault.put("lastProject:$id", selected.id)
+        if (changed) loadThreads()
         val last = vault.get("lastProject:$id")
         if (state.value.project == null && state.value.sessionTabs.isEmpty() && last != null) projects.find { it.id == last }?.let(::selectProject)
+    }
+    suspend fun addProject(path: String) {
+        require(path.startsWith('/') && path.none(Char::isISOControl)) { "请输入远程目录的绝对路径" }
+        val root = path.trimEnd('/').ifEmpty { "/" }
+        val repository = requireRepo()
+        repository.files(root)
+        check(repo === repository) { "连接已变化，请重试" }
+        val project = state.value.projects.firstOrNull { root in it.roots }
+            ?: orbitProjects.removedAt(root)
+            ?: ProjectInfo("cwd:$root", root.substringAfterLast('/').ifEmpty { "/" }, listOf(root))
+        orbitProjects.add(project)
+        val projects = orbitProjects.apply(state.value.projects)
+        vault.put("projects:${state.value.profile!!.id}", json.encodeToString(projects))
+        mutable.update { it.copy(projects = projects) }
+    }
+    fun moveProject(projectId: String, offset: Int) {
+        orbitProjects.move(state.value.projects, projectId, offset)
+        mutable.update { it.copy(projects = orbitProjects.apply(it.projects)) }
+    }
+    fun removeProject(project: ProjectInfo) {
+        orbitProjects.remove(project)
+        if (state.value.project?.id == project.id && state.value.thread == null) home()
+        val projects = orbitProjects.apply(state.value.projects)
+        val id = state.value.profile!!.id
+        vault.put("projects:$id", json.encodeToString(projects))
+        if (vault.get("lastProject:$id") == project.id) vault.remove("lastProject:$id")
+        mutable.update { it.copy(projects = projects) }
     }
     fun selectProject(project: ProjectInfo) {
         stashSession()
@@ -371,6 +421,7 @@ internal class HostWorkspace(
         }
     }
     fun openThread(thread: ThreadInfo, freshlyCreated: Boolean = false) {
+        mutable.update { s -> s.copy(sessionTabs = s.sessionTabs.map { if (it.thread.id == thread.id) it.copy(tabOpen = true, unread = false, progress = it.progress.viewed()) else it }) }
         if (state.value.thread?.id == thread.id && !freshlyCreated) { mutable.update { it.copy(tab = 0, preview = null, diff = null) }; return }
         stashSession()
         val snapshot = sessions[thread.id]
@@ -435,6 +486,7 @@ internal class HostWorkspace(
             }
             if (sessionLoads[thread.id] != generation || repo !== repository) return@launch
             historyLoaded = true
+            if ((turnRevisions[thread.id] ?: 0L) == revision) recordHistorySync(thread.id, page)
             updateSession(thread.id) { current -> current.copy(items = mergeItems(page.items, current.items.filterNot { old -> cached.any { it == old } }), historyCursor = page.cursor, activeTurn = if ((turnRevisions[thread.id] ?: 0L) == revision) page.turnId else current.activeTurn,
                 activeTurnStartedAtMs = if ((turnRevisions[thread.id] ?: 0L) == revision) page.items.firstOrNull { it.turnId == page.turnId }?.turnStartedAtMs else current.activeTurnStartedAtMs, cached = false) }
             cacheHistory(if (state.value.thread?.id == thread.id) state.value else sessions[thread.id] ?: return@launch)
@@ -490,7 +542,9 @@ internal class HostWorkspace(
             activeTurn = if (missing) null else it.activeTurn,
             activeTurnStartedAtMs = if (missing) null else it.activeTurnStartedAtMs,
             queuedMessages = pausedQueuedMessages(it.queuedMessages), queuePaused = it.queuedMessages.isNotEmpty(),
-            threadSyncError = if (missing) "电脑上找不到此会话的历史记录。已保留本机缓存和草稿；可刷新重试，或新建会话继续。" else "会话同步失败，可刷新重试：${failure.message}") }
+            threadSyncError = if (missing) "电脑上找不到此会话的历史记录。已保留本机缓存和草稿；可刷新重试，或新建会话继续。"
+                else if (failure is ThreadInUseException) failure.message
+                else "会话同步失败，可刷新重试：${failure.message}") }
     }
     private fun stashSession() { val s = state.value; s.thread?.id?.let { sessions[it] = s } }
     private fun updateSession(id: String, transform: (PocketState) -> PocketState) {
@@ -500,16 +554,30 @@ internal class HostWorkspace(
         if (visible) mutable.update { transform(it) } else sessions[id] = changed
         mutable.update { current -> current.copy(sessionTabs = current.sessionTabs.map { tab -> if (tab.thread.id == id) tab.copy(thread = changed.thread ?: tab.thread, running = changed.activeTurn != null, unread = tab.unread || !(visible && uiVisible)) else tab }) }
     }
-    fun closeConversation(id: String) {
+    fun trackTask(id: String, tracked: Boolean) {
+        mutable.update { s -> s.copy(sessionTabs = s.sessionTabs.map { if (it.thread.id == id) it.copy(tracked = tracked) else it }) }
+        if (!tracked && state.value.sessionTabs.any { it.thread.id == id && !it.tabOpen }) closeConversation(id, forget = true)
+        onQueueChanged()
+    }
+    fun closeConversation(id: String, forget: Boolean = false) {
         val source = if (state.value.thread?.id == id) state.value else sessions[id]
         val abandoned = source?.let { (if (it.sending) emptyList() else it.draftImages) + it.queuedMessages.filterNot { message -> message.sending }.flatMap { message -> message.images } }.orEmpty()
         val visible = state.value.thread?.id == id
         if (visible) closeThread()
-        sessions.remove(id); sessionLoads.remove(id)
-        mutable.update { it.copy(sessionTabs = it.sessionTabs.filterNot { tab -> tab.thread.id == id }) }
+        val retain = !forget && state.value.sessionTabs.any { it.thread.id == id && it.tracked }
+        if (retain) {
+            // Keep subscriptions and in-flight sends; discard only unsent drafts/queue entries.
+            sessions[id] = (sessions[id] ?: source ?: PocketState()).let { saved -> saved.copy(
+                draft = if (saved.sending) saved.draft else "",
+                draftImages = if (saved.sending) saved.draftImages else emptyList(),
+                draftContext = if (saved.sending) saved.draftContext else emptyList(),
+                queuedMessages = saved.queuedMessages.filter { it.sending }) }
+        } else { sessions.remove(id); sessionLoads.remove(id) }
+        mutable.update { it.copy(sessionTabs = if (retain) it.sessionTabs.map { tab -> if (tab.thread.id == id) tab.copy(tabOpen = false) else tab }
+            else it.sessionTabs.filterNot { tab -> tab.thread.id == id }) }
         val abandonedContext = source?.let { (if (it.sending) emptyList() else it.draftContext) + it.queuedMessages.filterNot { q -> q.sending }.flatMap { q -> q.context } }.orEmpty()
         viewModelScope.launch(Dispatchers.IO) { abandoned.forEach { java.io.File(it.path).delete() }; abandonedContext.mapNotNull { it.localPath }.forEach { java.io.File(it).delete() } }
-        if (visible) state.value.sessionTabs.lastOrNull()?.let { openThread(it.thread) }
+        if (visible) state.value.sessionTabs.lastOrNull { it.tabOpen }?.let { openThread(it.thread) }
     }
     fun renameSessionTab(id: String, name: String) {
         val label = name.trim().take(24)
@@ -522,23 +590,38 @@ internal class HostWorkspace(
         if (index < 0) return
         s.sessionTabs.getOrNull(index + direction)?.let { openThread(it.thread) }
     }
+    fun loadAllHistory() = work {
+        val target = state.value.thread ?: return@work
+        val repository = requireRepo()
+        val seen = mutableSetOf<String>()
+        var pages = 0
+        while (true) {
+            val source = session(target.id) ?: return@work
+            val cursor = source.historyCursor ?: break
+            require(seen.add(cursor)) { "历史分页未前进，已保留加载内容，请稍后重试" }
+            require(++pages <= 500 && source.items.size < 10000) { "本次已加载较多历史，请缩小搜索范围或稍后继续加载" }
+            val page = repository.history(target.id, cursor)
+            if (repo !== repository) return@work
+            updateSession(target.id) { it.copy(items = mergeItems(page.items, it.items), historyCursor = page.cursor) }
+        }
+    }
     fun moreHistory() = work {
         val s = state.value; val thread = s.thread ?: return@work; val cursor = s.historyCursor ?: return@work
         val page = requireRepo().history(thread.id, cursor)
         if (state.value.thread?.id == thread.id) mutable.update { it.copy(items = mergeItems(page.items, it.items), historyCursor = page.cursor) }
     }
-    fun createConversation(text: String, created: (SessionTab) -> Unit): Job {
+    fun createConversation(text: String, engineId: String = "codex", images: List<DraftImage> = emptyList(), context: List<ContextInput> = emptyList(), created: (SessionTab) -> Unit): Job {
         val source = state.value
         val project = requireNotNull(source.project)
         val repository = requireRepo()
         return work {
-            val thread = repository.newThread(project, source.root)
+            val thread = repository.forEngine(engineId).newThread(project, source.root)
             if (repo !== repository) return@work
-            val tab = SessionTab(thread, project, allocateTabNumber(), profileId = source.profile!!.id, profileName = source.profile.name)
+            val tab = SessionTab(thread, project, allocateTabNumber(), profileId = source.profile!!.id, profileName = source.profile.name, tracked = true)
             sessions[thread.id] = PocketState(profiles = source.profiles, profile = source.profile, connected = true,
                 project = project, root = source.root, directory = source.root, thread = thread,
-                threadReady = true, settings = repository.settings(thread.id), models = source.models,
-                queuedMessages = listOf(QueuedMessage(text)))
+                threadReady = true, settings = repository.settings(thread.id),
+                queuedMessages = listOf(QueuedMessage(text, images, context = context)))
             mutable.update { it.copy(sessionTabs = it.sessionTabs + tab,
                 threads = if (it.project?.id == project.id && !it.showArchived) listOf(thread) + it.threads else it.threads) }
             created(tab)
@@ -606,18 +689,22 @@ internal class HostWorkspace(
         val s = state.value; val cwd = s.root
         if (!s.connected || cwd.isBlank()) return
         choicesJob = viewModelScope.launch {
-            val repository = requireRepo()
-            mutable.update { it.copy(choicesLoading = true, choicesError = null, permissions = emptyList()) }
+            val hostRepository = requireRepo()
+            val selectedThread = s.thread?.id
+            mutable.update { it.copy(choicesLoading = true, choicesError = null, models = emptyList(), permissions = emptyList(), collaborationModes = emptyList()) }
             try {
+                val repository = hostRepository.forEngine(s.thread?.engineId ?: hostRepository.availableEngines.first())
                 supervisorScope {
                     val models = async { try { Result.success(repository.models()) } catch (c: CancellationException) { throw c } catch (e: Exception) { Result.failure(e) } }
                     val permissions = async { try { Result.success(repository.permissions(cwd)) } catch (c: CancellationException) { throw c } catch (e: Exception) { Result.failure(e) } }
                     val modes = async { try { repository.collaborationModes() } catch (c: CancellationException) { throw c } catch (_: Exception) { emptyList() } }
                     val m = models.await(); val p = permissions.await(); val availableModes = modes.await()
-                    if (state.value.root == cwd && repo === repository) mutable.update { it.copy(models = m.getOrNull() ?: it.models, permissions = p.getOrNull().orEmpty(), collaborationModes = availableModes,
+                    if (state.value.root == cwd && state.value.thread?.id == selectedThread && repo === hostRepository) mutable.update { it.copy(models = m.getOrNull() ?: it.models, permissions = p.getOrNull().orEmpty(), collaborationModes = availableModes,
                         choicesError = listOfNotNull(m.exceptionOrNull()?.message, p.exceptionOrNull()?.message).joinToString("；").takeIf(String::isNotBlank)) }
                 }
-            } finally { if (state.value.root == cwd && repo === repository) mutable.update { it.copy(choicesLoading = false) } }
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) { if (state.value.thread?.id == selectedThread && repo === hostRepository) mutable.update { it.copy(choicesError = error.message) } }
+            finally { if (state.value.root == cwd && state.value.thread?.id == selectedThread && repo === hostRepository) mutable.update { it.copy(choicesLoading = false) } }
         }
     }
     fun chooseCollaboration(mode: String) {
@@ -698,6 +785,7 @@ internal class HostWorkspace(
         val s = state.value; val thread = s.thread ?: return
         if ((s.draft.isBlank() && s.draftImages.isEmpty() && s.draftContext.isEmpty()) || s.contextLoading || s.imagesLoading || s.sending || s.sendingComments || s.settingsApplying || !s.connected || !s.threadReady) return
         if (s.draftImages.isNotEmpty() && s.models.find { it.id == s.settings?.model }?.inputModalities?.contains("image") == false) { error("当前模型不支持图片，请选择支持图片的模型"); return }
+        trackTask(thread.id, true)
         if (s.activeTurn != null || s.queuedMessages.isNotEmpty() || thread.id in reviewFinishing) {
             if (s.queuedMessages.size >= 20) { error("待发消息最多 20 条，请先处理已有消息。"); return }
             mutable.update { it.copy(queuedMessages = it.queuedMessages + QueuedMessage(s.draft, s.draftImages, context = s.draftContext),
@@ -773,6 +861,7 @@ internal class HostWorkspace(
         if (message.images.isNotEmpty() && s.models.find { it.id == s.settings?.model }?.inputModalities?.contains("image") == false) {
             updateSession(threadId) { it.copy(queuePaused = true, queuedMessages = it.queuedMessages.map { entry -> if (entry.id == id) entry.copy(error = "当前模型不支持图片，请切换模型后继续") else entry }) }; return
         }
+        trackTask(threadId, true)
         updateSession(threadId) { it.copy(sending = true, queuedMessages = it.queuedMessages.map { entry -> if (entry.id == id) entry.copy(sending = true, error = null) else entry }) }
         onQueueChanged()
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
@@ -815,7 +904,6 @@ internal class HostWorkspace(
     }
     fun stop() = work { val s = state.value; requireRepo().interrupt(s.thread?.id ?: return@work, s.activeTurn ?: return@work) }
     private suspend fun beginTurnReview(repository: AgentRepository, threadId: String, root: String) {
-        reviewPolls.remove(threadId)?.cancel()
         reviewBaselines.remove(threadId)
         updateSession(threadId) { it.copy(taskReview = null, taskReviewLoading = true, taskReviewError = null) }
         val baseline = try { withTimeout(6000) { repository.beginReviewBaseline(root) } }
@@ -827,20 +915,10 @@ internal class HostWorkspace(
         if (repo !== repository) return
         reviewBaselines[threadId] = baseline
         updateSession(threadId) { it.copy(taskReviewLoading = false) }
-        reviewPolls[threadId] = viewModelScope.launch {
-            while (repo === repository && reviewBaselines[threadId] == baseline) {
-                delay(8000)
-                if (!uiVisible || state.value.thread?.id != threadId || threadId in reviewFinishing) continue
-                try {
-                    val report = withTimeout(12000) { repository.taskReview(baseline) }
-                    if (repo === repository && reviewBaselines[threadId] == baseline) updateSession(threadId) { it.copy(taskReview = report, taskReviewError = null) }
-                } catch (e: Exception) { currentCoroutineContext().ensureActive() }
-            }
-        }.also { connectionJobs += it }
+        // Live changes are refreshed on demand; no timer runs while the turn is active.
     }
     private fun finishTurnReview(threadId: String) {
         val baseline = reviewBaselines.remove(threadId)
-        reviewPolls.remove(threadId)?.cancel()
         val repository = repo
         if (baseline == null || repository == null) { drainQueue(threadId); return }
         reviewFinishing += threadId
@@ -882,7 +960,7 @@ internal class HostWorkspace(
     }
     fun review(target: ReviewTarget) = work {
         val s = state.value
-        val thread = requireRepo().newThread(s.project ?: return@work, s.root, readOnly = true)
+        val thread = requireRepo().forEngine(s.thread?.engineId ?: requireRepo().availableEngines.first()).newThread(s.project ?: return@work, s.root, readOnly = true)
         openThread(thread, freshlyCreated = true)
         mutable.update { it.copy(tab = 0, threads = listOf(thread) + it.threads) }
         requireRepo().review(thread.id, target)
@@ -1052,9 +1130,10 @@ internal class HostWorkspace(
                 if (state.value.root != s.root || threadGeneration != generation) return@launch
                 val current = if (newConversation) null else s.thread?.takeIf { it.cwd == s.root && s.threadReady }
                 require(!steer || (current != null && session(current.id)?.activeTurn != null)) { "当前任务已结束，请正常发送评论" }
-                val target = current ?: repository.newThread(project, s.root)
+                val target = current ?: repository.forEngine(s.thread?.engineId ?: repository.availableEngines.first()).newThread(project, s.root)
                 targetId = target.id
                 if (current == null) openThread(target, freshlyCreated = true)
+                trackTask(target.id, true)
                 updateSession(target.id) { it.copy(sendingComments = true) }
                 val runtime = session(target.id) ?: state.value
                 val content = reviewFeedback(comments)
@@ -1118,7 +1197,7 @@ internal class HostWorkspace(
             }
             is AgentEvent.Archived -> {
                 repo?.forgetThread(event.threadId)
-                closeConversation(event.threadId)
+                closeConversation(event.threadId, forget = true)
                 if (state.value.project != null) loadThreads()
             }
             is AgentEvent.Settings -> {
@@ -1133,6 +1212,35 @@ internal class HostWorkspace(
             is AgentEvent.Timeline -> timelineEvent(event.threadId, event.update)
         }
     }
+    fun dismissTaskReminder(threadId: String, turnId: String) {
+        val current = session(threadId) ?: return
+        if (current.sending || current.activeTurn != null || state.value.pending.any { it.params.text("threadId") == threadId }) return
+        mutable.update { s -> s.copy(sessionTabs = s.sessionTabs.map { tab ->
+            if (tab.thread.id == threadId && tab.progress.turnId == turnId && tab.progress.status == "failed" && !tab.running)
+                tab.copy(progress = tab.progress.copy(dismissed = true, seen = true)) else tab
+        }) }
+        onQueueChanged()
+    }
+    private fun recordHistorySync(threadId: String, page: HistoryPage) {
+        mutable.update { state -> state.copy(sessionTabs = state.sessionTabs.map { tab ->
+            if (tab.thread.id != threadId) tab else {
+                val latest = page.latestTurn
+                val progress = if (latest == null) tab.progress else TaskProgress(latest.id, latest.status, latest.error,
+                    seen = tab.progress.turnId == latest.id && tab.progress.status == latest.status && tab.progress.seen,
+                    dismissed = tab.progress.turnId == latest.id && tab.progress.status == latest.status && tab.progress.dismissed)
+                val viewed = if (uiVisible && state.thread?.id == threadId && state.tab == 0) progress.viewed() else progress
+                tab.copy(progress = viewed.copy(syncedAt = System.currentTimeMillis()))
+            }
+        }) }
+    }
+    private fun recordTaskSync(threadId: String, update: TimelineUpdate? = null) {
+        mutable.update { s -> s.copy(sessionTabs = s.sessionTabs.map { tab ->
+            if (tab.thread.id == threadId) {
+                val progress = taskProgress(tab.progress, update, System.currentTimeMillis())
+                tab.copy(progress = if (uiVisible && s.thread?.id == threadId && s.tab == 0) progress.viewed() else progress)
+            } else tab
+        }) }
+    }
     private fun timelineEvent(threadId: String, update: TimelineUpdate) {
         if (threadId.isBlank()) return
         if (update is TimelineUpdate.Started && threadId !in reviewBaselines)
@@ -1143,8 +1251,8 @@ internal class HostWorkspace(
             val runtime = sessionEvent(SessionRuntime(current.items, current.activeTurn, current.activeTurnStartedAtMs), update, System.currentTimeMillis())
             current.copy(items = runtime.items, activeTurn = runtime.activeTurn, activeTurnStartedAtMs = runtime.startedAtMs)
         }
+        recordTaskSync(threadId, update)
         if (update is TimelineUpdate.Completed) {
-            if (update.status == "failed") error(update.error ?: "任务失败")
             cacheHistory(if (state.value.thread?.id == threadId) state.value else sessions[threadId] ?: return)
             if (update.status in setOf("failed", "interrupted")) updateSession(threadId) { it.copy(queuePaused = it.queuedMessages.isNotEmpty()) }
             finishTurnReview(threadId)

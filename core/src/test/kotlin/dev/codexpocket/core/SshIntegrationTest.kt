@@ -51,10 +51,60 @@ class SshIntegrationTest {
         return connectCodex(profile, secrets)
     }
 
+    @Test fun `shared traex daemon keeps both clients attached across disconnect`() = runBlocking<Unit> {
+        val binary = System.getenv("ORBIT_TRAEX_BINARY")
+        Assume.assumeTrue("Set ORBIT_TRAEX_BINARY for the isolated local multi-client probe", binary != null)
+        val root = Files.createTempDirectory("orbit-traex-shared").toFile()
+        val home = root.resolve("home").apply { mkdirs() }
+        val work = root.resolve("work").apply { mkdirs() }
+        home.resolve("traecli.toml").writeText("""
+            model_provider = "probe"
+            model = "probe"
+            [model_providers.probe]
+            name = "Offline protocol probe"
+            base_url = "http://127.0.0.1:1/v1"
+            wire_api = "responses"
+            requires_openai_auth = false
+        """.trimIndent())
+        val environment = "export TRAE_HOME=${shellQuote(home.path)}; agent_bin=${shellQuote(binary!!)}; "
+        var first: RpcClient? = null
+        var second: RpcClient? = null
+        try {
+            val command = "fixture-route:" + environment + agentProxyInvocation("traex")
+            val untrusted = assertFailsWith<HostKeyRequired> { SshConnection.connect(profile, secrets, command) }
+            val pinned = profile.copy(fingerprint = untrusted.identity.fingerprint)
+            val sshA = SshConnection.connect(pinned, secrets, command)
+            val rpcA = RpcClient(sshA, this).also { first = it; it.initialize() }
+            val repositoryA = CodexRepository(rpcA, sshA)
+            val thread = repositoryA.newThread(ProjectInfo("cwd:${work.path}", "Probe", listOf(work.path)), work.path)
+            rpcA.request("thread/inject_items", obj("threadId" to thread.id, "items" to listOf(
+                obj("type" to "message", "role" to "user", "content" to listOf(obj("type" to "input_text", "text" to "Local shared-session protocol probe"))))))
+            // The second connection repeats daemon start: it must reuse the first client's service.
+            val sshB = SshConnection.connect(pinned, secrets, command)
+            val rpcB = RpcClient(sshB, this).also { second = it; it.initialize() }
+            val repositoryB = CodexRepository(rpcB, sshB)
+            repositoryB.attachThread(thread.id)
+            val renamed = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(10000) { repositoryA.events.first { it is AgentEvent.Renamed && it.threadId == thread.id && it.title == "Shared probe" } }
+            }
+            repositoryB.renameThread(thread.id, "Shared probe")
+            renamed.await()
+            assertEquals("Shared probe", rpcA.request("thread/read", obj("threadId" to thread.id, "includeTurns" to false)).objectAt("thread").text("name"))
+            repositoryA.close(); first = null
+            repositoryB.renameThread(thread.id, "After disconnect")
+            assertEquals("After disconnect", rpcB.request("thread/read", obj("threadId" to thread.id, "includeTurns" to false)).objectAt("thread").text("name"))
+        } finally {
+            first?.close(); second?.close()
+            val stop = ProcessBuilder("sh", "-c", environment + "exec \"\$agent_bin\" app-server daemon stop").redirectErrorStream(true).start()
+            if (!stop.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)) stop.destroyForcibly()
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun `compatible engine uses normalized events and shared host services`() = runBlocking<Unit> {
         val untrusted = assertFailsWith<HostKeyRequired> { connectCodex(profile, secrets) }
         val compatible = profile.copy(fingerprint = untrusted.identity.fingerprint,
-            engineId = "codex-compatible", codexPath = "/fixture/fork-agent")
+            engineId = "traex")
         val repository: AgentRepository = AgentEngines.default.open(compatible, secrets, this)
         try {
             val seen = mutableListOf<AgentEvent>()
@@ -64,11 +114,27 @@ class SshIntegrationTest {
                 assertTrue(repository.models().isNotEmpty())
                 assertEquals("日本語と中文", repository.file("/fixture/project/README.md").bytes.toString(Charsets.UTF_8))
                 val project = repository.projects().first()
-                val thread = repository.newThread(project, project.roots.first())
+                val thread = repository.forEngine("traex").newThread(project, project.roots.first())
                 repository.send(thread.id, "fixture-queue-normalized", null)
                 withTimeout(5000) { while (seen.none { it is AgentEvent.Timeline && it.update is TimelineUpdate.Started }) delay(10) }
                 assertTrue(seen.any { it is AgentEvent.Timeline && it.threadId == thread.id })
             } finally { collector.cancelAndJoin() }
+        } finally { repository.close() }
+    }
+
+    @Test fun `an installed but unavailable agent does not block the healthy agent`() = runBlocking<Unit> {
+        val untrusted = assertFailsWith<HostKeyRequired> { connectCodex(profile, secrets) }
+        val trustedProfile = profile.copy(fingerprint = untrusted.identity.fingerprint)
+        server.commandFactory = org.apache.sshd.server.command.CommandFactory { _, command ->
+            ProcessCommand(if (command.contains("app-server proxy") && command.contains("command -v traex")) "fixture-unavailable-agent" else command)
+        }
+        val repository = AgentEngines.default.open(trustedProfile, secrets, this)
+        try {
+            repository.initialize()
+            assertEquals(listOf("codex"), repository.availableEngines)
+            assertTrue(repository.engineIssues.containsKey("traex"))
+            assertTrue(repository.models().isNotEmpty())
+            assertFailsWith<IllegalStateException> { repository.forEngine("traex") }
         } finally { repository.close() }
     }
 
@@ -297,6 +363,33 @@ class SshIntegrationTest {
         } finally { rpc.close() }
     }
 
+    @Test fun `repository groups Git subdirectory conversations and queries all member cwd values`() = runBlocking<Unit> {
+        val root = Files.createTempDirectory("orbit-project-group").toRealPath().toFile()
+        val process = ProcessBuilder("git", "init", root.path).redirectErrorStream(true).start()
+        process.inputStream.readBytes()
+        assertEquals(0, process.waitFor())
+        val ssh = trusted(); val rpc = RpcClient(ssh, this)
+        try {
+            rpc.initialize()
+            val repo = CodexRepository(rpc, ssh)
+            val cwds = listOf("app", "core").map { root.resolve(it).apply { mkdirs() }.path }
+            val threads = cwds.map { cwd ->
+                val group = ProjectInfo("cwd:$cwd", "child", listOf(cwd))
+                repo.newThread(group, cwd).also { repo.send(it.id, "fixture task", null) }
+            }
+            val project = repo.projects().single { it.id == "cwd:${root.path}" }
+            assertEquals(listOf(root.path), project.roots)
+            assertEquals(setOf(root.path) + cwds, project.threadCwds.toSet())
+            val loaded = repo.threads(project).first
+            assertEquals(threads.map { it.id }.toSet(), loaded.map { it.id }.toSet())
+            assertEquals(cwds.toSet(), loaded.map { it.cwd }.toSet())
+            threads.forEach { repo.archiveThread(it.id) }
+            val rediscovered = repo.projects(listOf(project)).single { it.id == project.id }
+            assertTrue(repo.threads(rediscovered).first.isEmpty())
+            assertEquals(threads.map { it.id }.toSet(), repo.threads(rediscovered, archived = true).first.map { it.id }.toSet())
+        } finally { rpc.close(); root.deleteRecursively() }
+    }
+
     @Test fun `SSH exec carries websocket RPC unicode fragmented large messages and approval replies`() = runBlocking<Unit> {
         val ssh = trusted()
         val rpc = RpcClient(ssh, this)
@@ -413,12 +506,25 @@ class SshIntegrationTest {
             assertEquals("final_answer", page.items.last().phase)
             assertEquals(thread.id, repo.threads(project).first.single().id)
             val reconnect = CodexRepository(rpc, ssh)
-            reconnect.attachThread(thread.id)
-            reconnect.attachThread(thread.id)
+            coroutineScope { List(8) { async { reconnect.attachThread(thread.id) } }.awaitAll() }
             assertEquals("1", rpc.request("probe/stats").text("resumeCount"))
             reconnect.forgetSubscription(thread.id)
             reconnect.attachThread(thread.id)
             assertEquals("2", rpc.request("probe/stats").text("resumeCount"))
+        } finally { rpc.close() }
+    }
+
+    @Test fun `writer conflict preserves ownership and remains retryable`() = runBlocking<Unit> {
+        val ssh = trusted(); val rpc = RpcClient(ssh, this)
+        try {
+            rpc.initialize()
+            val repo = CodexRepository(rpc, ssh)
+            repeat(2) {
+                val error = assertFailsWith<ThreadInUseException> { repo.attachThread("fixture-writer-conflict") }
+                assertTrue(error.cause is RpcError)
+                assertTrue(error.message.orEmpty().contains("共享后台"))
+                assertNull(repo.settings("fixture-writer-conflict"))
+            }
         } finally { rpc.close() }
     }
 
@@ -796,6 +902,8 @@ class SshIntegrationTest {
                 command.startsWith("[ ! -L ") -> listOf("sh", "-c", command)
                 command.startsWith("wc -c") && command.contains(System.getProperty("pocket.upload.root")) -> listOf("sh", "-c", command)
                 command.startsWith("git ") || command.startsWith("pocket_git=") -> listOf("sh", "-lc", command)
+                command == "cat" -> listOf("cat")
+                command.contains("command -v traex") && !command.contains("app-server proxy") -> listOf("sh", "-c", "printf 'codex\ntraex\n'")
                 command.contains("app-server proxy") -> listOf("python3", File(System.getProperty("pocket.root"), "tools/mock_codex.py").absolutePath)
                 command.startsWith("wc -c") -> listOf("sh", "-c", if (command.contains("oversized.png")) "printf 9000000" else "printf 21")
                 else -> listOf("sh", "-c", "exit 0")

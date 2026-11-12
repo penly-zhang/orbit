@@ -31,7 +31,9 @@ internal class PocketRuntime private constructor(val app: Application) {
     init {
         scope.launch(Dispatchers.IO) {
             val saved = runCatching { vault.get("workspace:v1")?.let { dev.codexpocket.core.json.decodeFromString<SavedWorkspace>(it) } }.getOrNull()
-            val retained = saved?.hosts.orEmpty().flatMap { it.tabs }.flatMap { tab -> (tab.images + tab.queuedMessages.flatMap { it.images }).map { it.path } + (tab.context + tab.queuedMessages.flatMap { it.context }).mapNotNull { it.localPath } }.toSet()
+            val newTask = runCatching { vault.get("newTaskAttachments:v1")?.let { dev.codexpocket.core.json.decodeFromString<NewTaskAttachments>(it) } }.getOrNull()
+            val newTaskPaths = newTask?.let { it.images.map { image -> image.path } + it.context.mapNotNull { item -> item.localPath } }.orEmpty()
+            val retained = newTaskPaths.toSet() + saved?.hosts.orEmpty().flatMap { it.tabs }.flatMap { tab -> (tab.images + tab.queuedMessages.flatMap { it.images }).map { it.path } + (tab.context + tab.queuedMessages.flatMap { it.context }).mapNotNull { it.localPath } }.toSet()
             listOf("composer-images", "composer-files").flatMap { java.io.File(app.filesDir, it).listFiles().orEmpty().toList() }.filter { it.isFile && it.absolutePath !in retained && System.currentTimeMillis() - it.lastModified() > 24 * 60 * 60 * 1000L }.forEach { it.delete() }
         }
         val connectivity = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -52,7 +54,12 @@ internal class PocketRuntime private constructor(val app: Application) {
         else if (visible) startConnectionService()
     }
     fun foreground(value: Boolean) {
+        val leaving = visible && !value
         visible = value
+        if (leaving && preferences.value.notifications) {
+            val state = controller.state.value
+            notices.changed(state.copy(pending = emptyList()), state)
+        }
         controller.setAppVisible(value)
         backgroundGrace?.cancel()
         if (!value && !preferences.value.background) backgroundGrace = scope.launch { delay(30000); if (!visible && !preferences.value.background) controller.pauseConnections() }
